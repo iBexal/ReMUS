@@ -5,4 +5,5 @@
 *.pyc
 *.png
 /spectra/
-/_superceded/
+/code/_superseded/
+*.zip
