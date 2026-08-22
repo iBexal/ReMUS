@@ -1,0 +1,8 @@
+*.fit
+*.fits
+/files/
+*.pdf
+*.pyc
+*.png
+/spectra/
+/_superceded/
