@@ -28,18 +28,19 @@ import wavelength_solution as ws
 # ----------------------------------------------------------------------
 # Paths
 # ----------------------------------------------------------------------
-SPECTRA_LOC = "/Users/ethan/Desktop/University/ReMES/spectra/2025-03-12/"
-WHITE_LOC = os.path.join(SPECTRA_LOC, "White")
-THAR_LOC = os.path.join(SPECTRA_LOC, "Flat")
-SCIENCE_FILE = os.path.join(SPECTRA_LOC, "Light", "Arcturus",
-                            "Arcturus_Light_300_secs_2025-03-13T00-56-21_005.fits")
-SOLUTION_PATH = os.path.join(SPECTRA_LOC, "wavelength_solution.pkl")
+SPECTRA_LOC = "/Users/ethan/Desktop/University/ReMES/spectra/2026-ASTR3010/2026-03-05"
+SOLUTION_PATH = os.path.join("/Users/ethan/Desktop/University/ReMES/spectra/2025-03-12/", "wavelength_solution.pkl")
+WHITE_LOC = os.path.join(SPECTRA_LOC, "Flats", "White-Light")
+THAR_LOC = os.path.join(SPECTRA_LOC, "Flats", "ThAr")
+SCIENCE_FILE = os.path.join(SPECTRA_LOC, "Light", "Sirius",
+                            "Sirius_Light_120_secs_2026-03-05T21-04-17_002.fits")
+
 ATLAS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "thar_linelist", "ThAr_lines.dat")
 
 THAR_FILE_INDEX = 2      # which ThAr frame to use; any clean one will do
 
-BUILD_NEW_MASTER = True
+BUILD_NEW_MASTER = False # True = build a new master from scratch; False = reuse the saved one
 
 # ----------------------------------------------------------------------
 # Instrument
@@ -138,7 +139,23 @@ def get_nad_pixels(orders):
     return pixels
 
 
-def build_master(orders, n_pixels):
+def load_reference_lines(seed_A=None, seed_B=None, n_pixels=4096):
+    """The atlas lines usable for calibration. Needs a rough dispersion so it
+    knows what the instrument can resolve; the master's own surface provides
+    that when reusing, the seed when building."""
+    sel_wave, sel_amp, full_wave, full_amp = ws.load_atlas(ATLAS_PATH)
+    fwhm_pixels = 2.355 * EXPECTED_LINE_SIGMA_PIXELS
+
+    def resolution_angstrom(wave):
+        return fwhm_pixels * wave * 2.0 * seed_B / ((n_pixels - 1) * seed_A)
+
+    return ws.select_reference_lines(sel_wave, sel_amp, full_wave, full_amp,
+                                     resolution_angstrom,
+                                     amplitude_min=ATLAS_AMPLITUDE_MIN,
+                                     dominance=ATLAS_DOMINANCE)
+
+
+def build_master(orders, n_pixels, white=None):
     K = ws.compute_grating_K(BLAZE_ANGLE_DEG, GROOVE_DENSITY_MM)
     print(f"\nGrating constant K = 2 d sin(blaze) = {K:.0f} A\n")
 
@@ -156,19 +173,7 @@ def build_master(orders, n_pixels):
 
     # --- atlas --------------------------------------------------------
     print()
-    sel_wave, sel_amp, full_wave, full_amp = ws.load_atlas(ATLAS_PATH)
-
-    # Resolution in Angstrom at a given wavelength, from the seed: the
-    # reference-line selection needs to know what the instrument can
-    # actually separate, and that scales with wavelength.
-    fwhm_pixels = 2.355 * EXPECTED_LINE_SIGMA_PIXELS
-
-    def resolution_angstrom(wave):
-        return fwhm_pixels * wave * 2.0 * seed.B / ((n_pixels - 1) * seed.A)
-
-    reference = ws.select_reference_lines(
-        sel_wave, sel_amp, full_wave, full_amp, resolution_angstrom,
-        amplitude_min=ATLAS_AMPLITUDE_MIN, dominance=ATLAS_DOMINANCE)
+    reference = load_reference_lines(seed.A, seed.B, n_pixels)
 
     # --- detect and lock ----------------------------------------------
     print()
@@ -218,7 +223,8 @@ def build_master(orders, n_pixels):
     offset = ws.diagnose_frame_offset(orders, solution, shift)
 
     if report.passed:
-        ws.save_solution(SOLUTION_PATH, solution, orders, report)
+        ws.save_solution(SOLUTION_PATH, solution, orders, report, white=white,
+                         atlas_path=ATLAS_PATH)
     else:
         print("NOT saving: the solution failed at least one check above. Fix the "
               "cause rather than loosening the threshold -- the checks are the only "
@@ -237,10 +243,23 @@ def build_master(orders, n_pixels):
     return solution, report
 
 
-def reuse_master(orders):
+def reuse_master(orders, white=None, n_pixels=None):
+    """Put the saved master onto tonight's traces and tonight's arc.
+
+    Nothing here assumes tonight's trace list looks like the master's.
+    Orders are identified by where they sit on the detector, so a faint
+    order the tracer missed -- at either end or in the middle -- costs that
+    order and nothing else.
+    """
     saved = ws.load_solution(SOLUTION_PATH)
-    ws.assign_order_numbers_from_saved(orders, saved)
-    ws.apply_saved_solution(orders, saved)
+    solution = saved["solution"]
+    reference = load_reference_lines(solution.m_lambda(n_pixels // 2, 100),
+                                     abs(solution.m_lambda(n_pixels - 1, 100)
+                                         - solution.m_lambda(0, 100)) / 2.0,
+                                     n_pixels)
+    shift, scatter, report = ws.apply_saved_solution(
+        orders, saved, white=white, reference=reference, n_pixels=n_pixels)
+    return shift, scatter, report
 
 
 def main():
@@ -259,9 +278,9 @@ def main():
         order.science_spectrum = order.extract_weighted(science_image, n_sigma=3)
 
     if BUILD_NEW_MASTER:
-        build_master(orders, n_pixels)
+        build_master(orders, n_pixels, white=white)
     else:
-        reuse_master(orders)
+        reuse_master(orders, white=white, n_pixels=n_pixels)
 
     ws.plot_calibrated_orders(orders, spectrum_attr="science_spectrum",
                               title="Arcturus, wavelength-calibrated orders")
