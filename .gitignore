@@ -28,3 +28,4 @@ __pycache__/
 *.npz
 *.DS_Store
 *.json
+.gitignore
