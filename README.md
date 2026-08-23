@@ -1,13 +1,8 @@
 # ReMUS
 
 Reduction pipeline for the Macquarie University echelle spectrograph. It
-traces the orders on a white-light flat, builds a master wavelength solution
-from a ThAr arc, applies that master to any later night, and writes
-wavelength-calibrated 1D spectra.
-
-The master is a description of the instrument rather than of one night. It is
-built once per instrument configuration and then registered onto new data, so
-routine reduction needs no interaction and no refitting.
+traces the orders on a white-light flat, applies a wavelength calibration
+to a nights observations, and writes wavelength-calibrated 1D spectra.
 
 ## Requirements
 
@@ -77,6 +72,9 @@ between the two Balmer lines.
 ```
 python one_off/make_master_thar.py
 ```
+The master is a description of the instrument rather than of one night. It is
+built once per instrument configuration and then registered onto new data, so
+routine reduction needs no interaction and no refitting.
 
 Needs white-light flats, one arc and one science frame. Click the two Na D
 lines when the plots open, D2 (5889.95 A) first. The run prints the refined
@@ -106,11 +104,7 @@ m * lambda(y) = a0 + (a1 * u + a2 * f) / sqrt(f**2 + u**2),   u = y - y_centre
 ```
 
 `f` is the camera focal length in pixels. A low-degree Chebyshev correction in
-(pixel, order number) is fitted on top. Two consequences follow: adjacent
-orders cannot disagree where they overlap, because they are two evaluations of
-one surface, and the model extrapolates sensibly past the pixels where lines
-were matched, because the basis is the optics rather than an arbitrary
-polynomial.
+(pixel, order number) is fitted on top. 
 
 Applying a master to a later night takes four steps, each of which reports
 itself:
@@ -125,8 +119,6 @@ itself:
 4. science spectra are extracted, cleaned of cosmic rays and written.
 
 ThAr line detection and atlas matching are redone from scratch for every arc.
-Nothing assumes the same lines are found each time. The shift itself uses no
-line identification at all, only a cross-correlation of the extracted spectra.
 
 ## Configuration
 
@@ -195,15 +187,9 @@ them measures the disagreement in velocity independently of the line list.
 
 ## Known limitations
 
-- The wavelength axis is in the arc frame, meaning observed wavelengths as
-  measured. The offset between an arc and a star is the target's velocity and
-  is not calibrated out. Applying it as a pixel shift would break the order
-  overlap, since a pixel is worth a different amount of wavelength in every
-  order; `diagnose_frame_offset` decides which kind of offset is present
-  before anything is applied.
 - Arcs should bracket each science exposure. With arcs on one side only the
   shift is held at its measured value across the gap, and instrument drift
-  cannot be separated from the target's motion.
+  can become degenerate with the target's motion, to an extent.
 - Cosmic-ray removal works on the extracted 1D spectrum and catches spikes one
   or two pixels wide. A long diagonal track crossing several rows is wider
   than that and is left alone.
