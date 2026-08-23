@@ -1,22 +1,22 @@
 ReMUS master wavelength solution
 ============================================================
-built            2026-08-23 02:21
-white flats      /Users/ethan/Desktop/University/ReMES/spectra/2025-03-12/White
+built            2026-08-23 20:37
+white flats      /Users/ethan/Desktop/University/ReMUS/spectra/2025-03-12/White
 arc frame        ThAr_Flat_5_secs_2025-03-12T23-02-50_018.fits
 science frame    Arcturus_Light_300_secs_2025-03-13T00-56-21_005.fits
 orders traced    137 down to 52
-orders fitted    137 down to 57
+orders fitted    136 down to 57
 camera focal     28278 px
 
 quality
 ------------------------------------------------------------
-[PASS] atlas lock             correlation SNR 57.2 (need >= 15)
+[PASS] atlas lock             correlation SNR 56.3 (need >= 15)
 [PASS] order numbers          the assigned numbering locks 7.7x better than m +/-1 or +/-2 (need >= 2x)
-[PASS] line residuals         1228 lines, rms 2.67 mA = 138 m/s (need <= 15 mA)
-[PASS] cross-validation       held-out rms 2.63 mA (0.99x the fitted rms; a large ratio means over-fitting)
-[PASS] order coverage         77/86 orders carry >= 4 matched lines (need >= 60%)
+[PASS] line residuals         1223 lines, rms 2.69 mA = 139 m/s (need <= 15 mA)
+[PASS] cross-validation       held-out rms 2.66 mA (0.99x the fitted rms; a large ratio means over-fitting)
+[PASS] order coverage         76/86 orders carry >= 4 matched lines (need >= 60%)
 [PASS] pixel coverage         matched lines span 84% of the detector in the median order (need >= 75%; less means the ends are extrapolated, and the ends are where orders overlap)
-[PASS] residual trends        largest binned mean residual 0.57 mA vs pixel/order (need <= 6 mA; structure here means the model is too stiff)
-[PASS] order overlap          60 overlapping pairs agree to 76 m/s median, 760 m/s worst (need <= 600 m/s)
+[PASS] residual trends        largest binned mean residual 0.92 mA vs pixel/order (need <= 6 mA; structure here means the model is too stiff)
+[PASS] order overlap          60 overlapping pairs agree to 75 m/s median, 759 m/s worst (need <= 600 m/s)
 
 science frame sits +67.4 px from the arc (doppler); axis left in the arc frame
