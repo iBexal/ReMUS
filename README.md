@@ -1,8 +1,7 @@
 # ReMUS
 
-Reduction pipeline for the Macquarie University echelle spectrograph. It
-traces the orders on a white-light flat, applies a wavelength calibration
-to a nights observations, and writes wavelength-calibrated 1D spectra.
+Reduction for the Macquarie University Spectrograph. Currently, ReMUS does
+order tracing, wavelength calibration, and an attempt at cosmic ray removal.
 
 ## Requirements
 
