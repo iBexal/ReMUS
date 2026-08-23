@@ -4,8 +4,8 @@ Images are 2D of shape (ny, nx). Rows, the y axis, are the dispersion
 direction; columns, the x axis, are the cross dispersion direction.
 Wavelengths are handled in wavelength_solution.py.
 
-Main entry points: trace_orders, trace_single_order, find_spurious_peaks,
-and the Order class.
+Main entry points: trace_orders, trace_single_order, choose_trace_window,
+find_spurious_peaks, and the Order class.
 """
 
 import glob
@@ -278,14 +278,60 @@ def find_spurious_peaks(heights, n_neighbors=2, rel_threshold=0.3):
     return spurious
 
 
-def trace_single_order(image, start_x, window=8, step=20):
+def _fit_row(image, row, guess, window):
+    """Fit a Gaussian to one row of an image near a guessed column.
+
+    Parameters
+    ----------
+    image : ndarray
+        2D image of shape (ny, nx).
+    row : int
+        Row index to fit.
+    guess : float
+        Column the fit window is centred on, in pixels.
+    window : float
+        Half width of the fit window, in pixels.
+
+    Returns
+    -------
+    popt : tuple or None
+        (amplitude, center, sigma, offset) from the fit, or None if the
+        window holds fewer than 5 columns or the fit did not converge.
+    """
+    nx = image.shape[1]
+    xmin = max(0, int(np.floor(guess - window)))
+    xmax = min(nx, int(np.ceil(guess + window + 1)))
+    if xmax - xmin < 5:
+        return None
+    x = np.arange(xmin, xmax)
+    profile = image[row, xmin:xmax]
+    try:
+        p0 = (profile.max() - np.median(profile), guess, 2.0, np.median(profile))
+        popt, _ = curve_fit(gaussian, x, profile, p0=p0)
+        return popt
+    except Exception:
+        return None
+
+
+def trace_single_order(image, start_x, window=8, step=20, predictive=True,
+                       max_jump=4.0, sigma_limits=(0.6, 6.0),
+                       min_amplitude_sigma=3.0):
     """Trace one order by fitting a Gaussian to rows across the image.
 
     Fitting starts at the middle row with start_x as the first guess, then
-    walks outwards in both directions every step rows, each successful fit
-    seeding the next guess. Rows that are not sampled or whose fit fails
-    stay NaN. All three arrays are entirely NaN if the middle row fit
-    fails.
+    walks outwards in both directions every step rows. With predictive set,
+    each row is fitted around the previous center extrapolated by the local
+    slope, measured from the last two accepted rows, so the tracer follows
+    a steep order as long as its slope changes slowly; a fit is kept only
+    if it lands within max_jump of that prediction, its width lies inside
+    sigma_limits and its amplitude stands above the scatter of the fit
+    residual. A rejected row leaves NaN and the walk continues from the
+    prediction, so one bad row does not drag the rest of the trace with it.
+    With predictive cleared, each row is fitted around the previous center
+    with no extrapolation and every converged fit is kept, which is the
+    older and weaker behaviour. Rows that are not sampled or whose fit is
+    rejected stay NaN. All three arrays are entirely NaN if the middle row
+    fit fails.
 
     Parameters
     ----------
@@ -293,11 +339,22 @@ def trace_single_order(image, start_x, window=8, step=20):
         2D image of shape (ny, nx), rows along dispersion.
     start_x : float
         Initial guess for the trace position at the middle row, in pixels.
-    window : int, optional
+    window : float, optional
         Half width of the column range fitted around each guess, in
         pixels. Default 8. Rows offering fewer than 5 columns are skipped.
     step : int, optional
         Row spacing between fits, in pixels. Default 20.
+    predictive : bool, optional
+        Extrapolate the local slope and validate each fit. Default True.
+    max_jump : float, optional
+        Largest accepted distance between a fitted center and the
+        predicted one, in pixels. Default 4.0. Ignored unless predictive.
+    sigma_limits : tuple of float, optional
+        Smallest and largest accepted fitted profile width, in pixels.
+        Default (0.6, 6.0). Ignored unless predictive.
+    min_amplitude_sigma : float, optional
+        Amplitude required, as a multiple of the robust scatter of the fit
+        residual. Default 3.0. Ignored unless predictive.
 
     Returns
     -------
@@ -315,42 +372,90 @@ def trace_single_order(image, start_x, window=8, step=20):
     sigmas = np.full(ny, np.nan)
     amplitudes = np.full(ny, np.nan)
 
-    def fit_row(row, guess):
-        """Fit one row near guess; None if the fit is not possible."""
-        xmin = max(0, int(np.floor(guess - window)))
-        xmax = min(nx, int(np.ceil(guess + window + 1)))
-        if xmax - xmin < 5:
-            return None
+    def accept(popt, prediction, row):
+        """True if this fit can be the same order continuing."""
+        if popt is None:
+            return False
+        if not predictive:
+            return True
+        amplitude, center, sigma, _ = popt
+        if not np.isfinite([amplitude, center, sigma]).all():
+            return False
+        if abs(center - prediction) > max_jump:
+            return False
+        if not sigma_limits[0] <= abs(sigma) <= sigma_limits[1]:
+            return False
+        # significance against the scatter of the fit residual, which is a
+        # real noise estimate; the scatter of the raw pixels in the window
+        # is not, since the order itself dominates it
+        xmin = max(0, int(np.floor(prediction - window)))
+        xmax = min(nx, int(np.ceil(prediction + window + 1)))
         x = np.arange(xmin, xmax)
-        profile = image[row, xmin:xmax]
-        try:
-            p0 = (profile.max() - np.median(profile), guess, 2, np.median(profile))
-            popt, _ = curve_fit(gaussian, x, profile, p0=p0)
-            return popt
-        except Exception:
-            return None
+        scatter = 1.4826 * np.median(np.abs(image[row, xmin:xmax] - gaussian(x, *popt)))
+        return amplitude > min_amplitude_sigma * max(scatter, 1e-9)
 
-    popt = fit_row(mid_y, start_x)
-    if popt is None:
+    popt = _fit_row(image, mid_y, start_x, window)
+    if not accept(popt, start_x, mid_y):
         return centers, sigmas, amplitudes
-    centers[mid_y], sigmas[mid_y], amplitudes[mid_y] = popt[1], popt[2], popt[0]
+    centers[mid_y], sigmas[mid_y], amplitudes[mid_y] = popt[1], abs(popt[2]), popt[0]
 
     for direction in (-step, step):
-        guess = centers[mid_y]
+        last_row, last_x = mid_y, centers[mid_y]
+        slope = 0.0
         rows = range(mid_y + direction, -1 if direction < 0 else ny, direction)
         for row in rows:
-            popt = fit_row(row, guess)
-            if popt is None:
+            prediction = last_x + slope * (row - last_row) if predictive else last_x
+            popt = _fit_row(image, row, prediction, window)
+            if not accept(popt, prediction, row):
                 continue
-            centers[row], sigmas[row], amplitudes[row] = popt[1], popt[2], popt[0]
-            guess = popt[1]
+            center = popt[1]
+            if predictive and row != last_row:
+                measured = (center - last_x) / (row - last_row)
+                # ease the slope in so one noisy row cannot swing the walk
+                slope = 0.5 * slope + 0.5 * measured
+            centers[row], sigmas[row], amplitudes[row] = center, abs(popt[2]), popt[0]
+            last_row, last_x = row, center
 
     return centers, sigmas, amplitudes
 
 
+def choose_trace_window(peaks, window=8.0, verbose=True):
+    """Shrink the fit window if the orders sit closer together than it.
+
+    A window wider than half the order separation reaches into the
+    neighbouring order, and the fit will eventually prefer that neighbour.
+
+    Parameters
+    ----------
+    peaks : ndarray
+        Order positions at the middle row, in pixels.
+    window : float, optional
+        Requested half width of the fit window, in pixels. Default 8.0.
+    verbose : bool, optional
+        Print a line when the window is reduced. Default True.
+
+    Returns
+    -------
+    window : float
+        The requested window, or half the smallest order separation minus
+        one pixel where that is smaller, with a floor of 3 pixels.
+    """
+    if len(peaks) < 2:
+        return window
+    closest = float(np.min(np.diff(np.sort(peaks))))
+    safe = max(3.0, closest / 2.0 - 1.0)
+    if safe < window:
+        if verbose:
+            print(f"Orders come within {closest:.0f} px, so a +/-{window:g} px fit "
+                  f"window overlaps the neighbour; using +/-{safe:.1f} px")
+        return safe
+    return window
+
+
 def trace_orders(white_loc, diagnose=False, n_expected=None, auto_exclude=True,
                  exclude_rel_threshold=0.3, extra_exclude_indices=None,
-                 prominence_fraction=0.005, min_separation=15):
+                 prominence_fraction=0.005, min_separation=15,
+                 window=8.0, step=20, auto_window=True, trace_degree=3):
     """Find and trace every order visible in a coadded white light flat.
 
     All FITS files in white_loc are median coadded, peaks are located in
@@ -383,6 +488,18 @@ def trace_orders(white_loc, diagnose=False, n_expected=None, auto_exclude=True,
     min_separation : int, optional
         Minimum separation between peaks across dispersion, in pixels.
         Default 15.
+    window : float, optional
+        Half width of the column range fitted around each guess, in
+        pixels. Default 8.0.
+    step : int, optional
+        Row spacing between fits, in pixels. Default 20.
+    auto_window : bool, optional
+        Reduce window where the orders sit closer together than twice it,
+        via choose_trace_window. Default True.
+    trace_degree : int, optional
+        Degree of the polynomials fitted to the measured trace centers and
+        widths. Default 3. Raise it for strongly curved orders, having
+        checked the residual with one_off/check_tracing.py.
 
     Returns
     -------
@@ -442,16 +559,21 @@ def trace_orders(white_loc, diagnose=False, n_expected=None, auto_exclude=True,
         print(f"Excluding {len(exclude)} peak(s) at x={peaks[~keep].tolist()}")
         peaks = peaks[keep]
 
+    if auto_window:
+        window = choose_trace_window(peaks, window)
+
     orders = []
     for peak in peaks:
-        centers, sigmas, _ = trace_single_order(coadded, start_x=peak, step=20)
+        centers, sigmas, _ = trace_single_order(coadded, start_x=peak,
+                                                window=window, step=step)
         good = np.isfinite(centers)
-        if np.sum(good) < 4:
+        if np.sum(good) < trace_degree + 2:
             print(f"Skipping order at x={peak}: only {np.sum(good)} traced points")
             continue
         rows = np.where(good)[0]
-        order = Order(center_poly=np.poly1d(np.polyfit(rows, centers[good], 3)),
-                      sigma_poly=np.poly1d(np.polyfit(rows, sigmas[good], 3)))
+        order = Order(
+            center_poly=np.poly1d(np.polyfit(rows, centers[good], trace_degree)),
+            sigma_poly=np.poly1d(np.polyfit(rows, sigmas[good], trace_degree)))
         order.trace_center_pixel = float(peak)
         orders.append(order)
 
