@@ -27,14 +27,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import glob
-
-import fitsio
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import find_peaks
 
 import config
+import frames
 from order_tracing import (choose_trace_window, find_spurious_peaks,
                            trace_single_order)
 
@@ -92,7 +90,8 @@ def build_master_white(white_loc):
     Parameters
     ----------
     white_loc : str
-        Directory holding the white-light flats.
+        Directory holding the white-light flats. Frames are read through
+        frames.read_image, so config.TRANSPOSE applies.
 
     Returns
     -------
@@ -106,14 +105,11 @@ def build_master_white(white_loc):
     FileNotFoundError
         If the directory holds no FITS files.
     """
-    paths = sorted(glob.glob(os.path.join(white_loc, "*.fits")))
+    paths = frames.list_frames(white_loc)
     if not paths:
-        raise FileNotFoundError(f"no FITS files in {white_loc}")
-    frames = []
-    for path in paths:
-        with fitsio.FITS(path) as f:
-            frames.append(f[0].read())
-    return np.median(frames, axis=0), len(paths)
+        raise FileNotFoundError(
+            f"no frames matching {config.FRAME_PATTERN} in {white_loc}")
+    return np.median([frames.read_image(p) for p in paths], axis=0), len(paths)
 
 
 def find_order_peaks(coadd, prominence_fraction=PROMINENCE_FRACTION,
@@ -556,6 +552,7 @@ print(f"master white: {n_frames} frames, shape {coadd.shape}, "
 
 if SAVE_MASTER_WHITE:
     master_path = os.path.join(OUT_DIR, "master_white.fits")
+    import fitsio
     if os.path.exists(master_path):
         os.remove(master_path)
     with fitsio.FITS(master_path, "rw") as f:
