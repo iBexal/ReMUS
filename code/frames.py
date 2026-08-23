@@ -1,11 +1,12 @@
-"""
-frames.py
+"""Locate FITS frames, read them, and read the times they were taken.
 
-Finding FITS frames, reading them, and knowing when they were taken.
+Times let an arc be chosen for a science exposure by comparison of
+timestamps rather than by file order. Every time is reported with the
+source it came from, since the header and the filename are different
+clocks.
 
-Nothing here knows about wavelengths. It exists so that choosing an arc for
-a science exposure is a matter of comparing timestamps rather than counting
-files in a directory and hoping the order is meaningful.
+Main entry points: read_image, read_header, mid_exposure_time, list_frames,
+list_arcs, nearest_arc, bracketing_arcs, describe_arc_choice.
 """
 
 import glob
@@ -16,30 +17,69 @@ from datetime import datetime, timedelta
 import fitsio
 import numpy as np
 
-# Filenames carry a time too -- ..._2025-03-12T22-57-07_008.fits -- but it is
-# not the same clock as the header. On this data DATE-OBS is UTC while the
-# filename is local, eleven hours apart. Mixing the two silently would put an
-# arc most of a day away from its science frame, so the header is used for
-# everything and the filename only as a last resort, with the source
-# reported so a mixture can be spotted.
+# Filenames carry a time as well, for example
+# ..._2025-03-12T22-57-07_008.fits, but it is not the same clock as the
+# header: on this data DATE-OBS is UTC and the filename is local, eleven
+# hours apart. The header is used where available and the filename only as a
+# last resort, with the source reported so a mixture can be spotted.
 _FILENAME_TIME = re.compile(r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})")
 
 
 def read_image(path):
-    """Read the primary image of a FITS file."""
+    """Read the primary image of a FITS file.
+
+    Parameters
+    ----------
+    path : str
+        Path to the FITS file.
+
+    Returns
+    -------
+    image : ndarray
+        Data of the primary HDU, 2D of shape (ny, nx) for detector frames.
+    """
     with fitsio.FITS(path, "r") as f:
         return f[0].read()
 
 
 def read_header(path):
+    """Read the primary header of a FITS file.
+
+    Parameters
+    ----------
+    path : str
+        Path to the FITS file.
+
+    Returns
+    -------
+    header : fitsio.FITSHDR
+        Header of the primary HDU, indexable by keyword.
+    """
     with fitsio.FITS(path, "r") as f:
         return f[0].read_header()
 
 
 def observation_time(path):
-    """(start time, exposure seconds, where the time came from).
+    """Return the start time of an exposure and where it came from.
 
-    Returns (None, ...) if no time could be found at all.
+    The DATE-OBS header is used when it is present and parsable, otherwise
+    a timestamp in the filename. The two are different clocks, so the
+    source is reported alongside the time.
+
+    Parameters
+    ----------
+    path : str
+        Path to the FITS file.
+
+    Returns
+    -------
+    start : datetime or None
+        Start of the exposure, None if neither the header nor the filename
+        yielded a time.
+    exptime : float
+        Exposure time in seconds, 0.0 if EXPTIME is missing or unreadable.
+    source : str
+        "DATE-OBS", "filename", or "none" if no time was found.
     """
     exptime = 0.0
     try:
@@ -68,10 +108,24 @@ def observation_time(path):
 
 
 def mid_exposure_time(path):
-    """The middle of the exposure, which is the moment an arc should match.
+    """Return the mid point of an exposure and where its time came from.
 
-    (start time, source). Half the exposure is 150 s on a 300 s frame, which
-    is not nothing when arcs are minutes apart.
+    The mid point is the moment an arc should be matched against. Half an
+    exposure is 150 s on a 300 s frame, which matters when arcs are minutes
+    apart.
+
+    Parameters
+    ----------
+    path : str
+        Path to the FITS file.
+
+    Returns
+    -------
+    middle : datetime or None
+        Start time plus half the exposure time, None if no start time could
+        be read.
+    source : str
+        "DATE-OBS", "filename", or "none".
     """
     start, exptime, source = observation_time(path)
     if start is None:
@@ -80,7 +134,22 @@ def mid_exposure_time(path):
 
 
 def list_frames(directory, pattern="*.fits", recursive=False):
-    """Every frame in a directory, sorted by name."""
+    """List the frames in a directory, sorted by path.
+
+    Parameters
+    ----------
+    directory : str
+        Directory to search.
+    pattern : str, optional
+        Filename glob pattern. Default "*.fits".
+    recursive : bool, optional
+        When True, search subdirectories as well. Default False.
+
+    Returns
+    -------
+    paths : list of str
+        Matching file paths in sorted order, empty if nothing matches.
+    """
     if recursive:
         found = glob.glob(os.path.join(directory, "**", pattern), recursive=True)
     else:
@@ -89,11 +158,28 @@ def list_frames(directory, pattern="*.fits", recursive=False):
 
 
 def list_arcs(directory, pattern="*ThAr*.fits", verbose=True):
-    """Arc frames with their mid-exposure times, earliest first.
+    """List arc frames with their mid-exposure times, earliest first.
 
-    Frames whose time cannot be read are dropped -- an arc that cannot be
-    placed in time cannot be chosen by time, and silently treating it as if
-    it were at some default moment is worse than not using it.
+    Frames whose time cannot be read are dropped and reported, since an arc
+    that cannot be placed in time cannot be chosen by time. A warning is
+    printed when the times came from more than one source, because DATE-OBS
+    and the filename are not comparable.
+
+    Parameters
+    ----------
+    directory : str
+        Directory to search.
+    pattern : str, optional
+        Filename glob pattern. Default "*ThAr*.fits".
+    verbose : bool, optional
+        When True, print the number of arcs found, the span they cover in
+        minutes, and the time sources used. Default True.
+
+    Returns
+    -------
+    arcs : list of tuple
+        (path, mid-exposure datetime) pairs sorted by time, empty if no
+        usable arc was found.
     """
     arcs = []
     sources = set()
@@ -118,7 +204,22 @@ def list_arcs(directory, pattern="*ThAr*.fits", verbose=True):
 
 
 def nearest_arc(arcs, when):
-    """The arc closest in time, and the gap in minutes."""
+    """Return the arc closest in time to a given moment.
+
+    Parameters
+    ----------
+    arcs : list of tuple
+        (path, datetime) pairs, as returned by list_arcs.
+    when : datetime
+        Moment to compare against, usually a science mid-exposure time.
+
+    Returns
+    -------
+    path : str or None
+        Path of the closest arc, None if arcs is empty.
+    gap : float or None
+        Absolute separation in time, in minutes, None if arcs is empty.
+    """
     if not arcs:
         return None, None
     gaps = [abs((t - when).total_seconds()) / 60.0 for _, t in arcs]
@@ -127,11 +228,26 @@ def nearest_arc(arcs, when):
 
 
 def bracketing_arcs(arcs, when):
-    """The last arc before `when` and the first after it.
+    """Return the last arc at or before a moment and the first after it.
 
-    Either may be None. Two of them let the shift be interpolated to the
-    exposure rather than assumed constant across the gap, which is the whole
-    reason for bracketing a science frame with arcs.
+    Two bracketing arcs let the shift be interpolated to the exposure
+    rather than assumed constant across the gap.
+
+    Parameters
+    ----------
+    arcs : list of tuple
+        (path, datetime) pairs, as returned by list_arcs.
+    when : datetime
+        Moment to bracket, usually a science mid-exposure time.
+
+    Returns
+    -------
+    before : tuple or None
+        (path, datetime) of the latest arc at or before when, None if there
+        is no such arc.
+    after : tuple or None
+        (path, datetime) of the earliest arc after when, None if there is
+        no such arc.
     """
     before = [a for a in arcs if a[1] <= when]
     after = [a for a in arcs if a[1] > when]
@@ -139,10 +255,34 @@ def bracketing_arcs(arcs, when):
 
 
 def describe_arc_choice(science_path, arcs, interpolate=True, max_gap_minutes=90.0):
-    """Work out which arc or arcs a science frame should use, and say so.
+    """Choose the arc or arcs a science frame should use and report them.
 
-    Returns (list of (path, time), science mid-time). One entry means the
-    shift is taken from that arc; two means it is interpolated between them.
+    The choice is printed, along with warnings when the frame's time source
+    differs from the arcs', when the nearest arc is further away than
+    max_gap_minutes, and when the exposure is not bracketed by arcs.
+
+    Parameters
+    ----------
+    science_path : str
+        Path to the science FITS frame.
+    arcs : list of tuple
+        (path, datetime) pairs, as returned by list_arcs.
+    interpolate : bool, optional
+        When True, return both bracketing arcs where they exist so the
+        shift can be interpolated. Default True.
+    max_gap_minutes : float, optional
+        Separation beyond which a single nearest arc raises a printed
+        warning, in minutes. Default 90.0.
+
+    Returns
+    -------
+    chosen : list of tuple
+        (path, datetime) pairs. Two entries mean the shift is interpolated
+        between them, one entry means it is taken from that arc, and an
+        empty list means no arc was available.
+    when : datetime or None
+        Mid-exposure time of the science frame, None if no time could be
+        read, in which case the first arc is returned if there is one.
     """
     when, source = mid_exposure_time(science_path)
     name = os.path.basename(science_path)
@@ -153,8 +293,8 @@ def describe_arc_choice(science_path, arcs, interpolate=True, max_gap_minutes=90
     arc_sources = {observation_time(a)[2] for a, _ in arcs}
     if arc_sources and source not in arc_sources:
         print(f"  WARNING: this frame's time came from {source} while the arcs' came "
-              f"from {'/'.join(sorted(arc_sources))}. Those are different clocks -- "
-              f"DATE-OBS is UTC here and the filename is local -- so the gaps below "
+              f"from {'/'.join(sorted(arc_sources))}. Those are different clocks: "
+              f"DATE-OBS is UTC here and the filename is local, so the gaps below "
               f"are not meaningful.")
 
     before, after = bracketing_arcs(arcs, when)

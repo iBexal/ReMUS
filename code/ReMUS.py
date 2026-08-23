@@ -1,14 +1,12 @@
-"""
-ReMUS.py
+"""Reduce one night of science frames against the saved master solution.
 
-Run this to reduce a night. It takes the master wavelength solution built by
-make_master_thar.py, registers it onto this night's traces and arcs, and
-writes wavelength-calibrated spectra.
+Nothing is fitted here. The master built by one_off/make_master_thar.py is
+registered onto this night's traces and arcs, each science frame is given
+the arc nearest it in time (interpolated between two where it is bracketed),
+the result is checked against the ThAr atlas, and calibrated spectra are
+written to config.REDUCED_ROOT as one .npz per frame.
 
-No master is built here and nothing is fitted from scratch. Each science
-frame is given the arc nearest it in time -- interpolated between two if it
-is bracketed -- and the result is checked against the line list before
-anything is written.
+Set NIGHT and TARGET below and run it.
 """
 
 import os

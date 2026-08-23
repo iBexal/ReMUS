@@ -1,13 +1,8 @@
-"""
-config.py
+"""Settings for the instrument and the pipeline.
 
-Everything that belongs to the instrument and to the pipeline rather than to
-one night's data. Both run files import this, so a change here reaches all of
-them and nothing has to be kept in step by hand.
-
-What is NOT here: which night you are reducing and which target. Those live
-in the run files (make_master_thar.py, ReMUS.py), because they change every
-time you use the thing.
+Every module imports this, so a value defined here is defined once. Settings
+that change from run to run, such as which night and which target, live in
+the run files instead: ReMUS.py and one_off/make_master_thar.py.
 """
 
 import os
@@ -24,7 +19,7 @@ CODE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # The master solution does NOT live with a night's data. It describes the
 # instrument, not an observing run, and it has to be reachable whatever is
-# being reduced -- including a night whose folder did not exist when the
+# being reduced, including a night whose folder did not exist when the
 # master was built. So it sits in one fixed place at the top of the project.
 CALIBRATION_DIR = os.path.join(PROJECT_ROOT, "calibration")
 MASTER_PATH = os.path.join(CALIBRATION_DIR, "master_wavelength_solution.pkl")
@@ -67,7 +62,7 @@ NAD_LINES = [(5889.95, "Na D2"), (5895.92, "Na D1")]
 EXPECTED_LINE_SIGMA_PIXELS = 3.3
 
 # Reference lines must be strong, and must dominate their own resolution
-# element -- this atlas carries about four lines per Angstrom in the blue
+# element. The atlas carries about four lines per Angstrom in the blue
 # against a resolution element of a tenth of one.
 ATLAS_AMPLITUDE_MIN = 200.0
 ATLAS_DOMINANCE = 5.0

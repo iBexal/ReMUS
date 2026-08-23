@@ -1,30 +1,27 @@
-"""
-one_off/find_anchors.py
+"""Identify the orders holding H-alpha, H-beta and Na D, and solve for m.
 
-Run this once for a spectrograph the pipeline has never seen, to work out
-which traced order holds H-alpha, H-beta and the Na D doublet, and what the
-absolute echelle order numbers are.
+Run once per spectrograph. It produces the three config.py settings that
+cannot be derived from an arc, because an arc has no line of known identity:
+DIRECTION, ANCHORS and NAD_TRACE.
 
-It produces the three settings in config.py that nothing else can derive:
-DIRECTION, ANCHORS and NAD_TRACE. The arc cannot give them -- a ThAr frame
-has no line whose identity you know in advance -- so they come from a star,
-once, by eye.
+Inputs: white-light flats to trace with, and one science frame of a star
+showing H-alpha, H-beta and Na D. A bright, moderately warm star is easiest,
+since the Balmer lines are broad. Arcturus works.
 
-What you need: white-light flats to trace with, and one science frame of a
-star showing H-alpha, H-beta and Na D. A bright, fairly warm star is easiest
-(the Balmer lines are broad and unmistakable); Arcturus works.
+Procedure:
 
-How it goes:
+  1. a map of all orders opens; the two widest dark features are the Balmer
+     lines. Note their trace indices and close the map.
+  2. a browser opens for each line. Arrow keys change order, a click accepts.
+     The click does not need to be precise, it is refined by a Gaussian fit.
+  3. the absolute order numbers are solved and printed ready to paste into
+     config.py.
 
-  1. a map of every order at once opens. The two broad dark smudges are the
-     Balmer lines -- note their trace indices and close it;
-  2. a browser opens for each line in turn. Arrow keys change order, a click
-     accepts. You do not need to click precisely;
-  3. the absolute order numbers are solved and printed ready to paste.
+The solve does not require the grating constant. Setting BLAZE_ANGLE_DEG and
+GROOVE_DENSITY_MM below adds the only independent check that no order was
+missed between the two Balmer lines.
 
-The solve needs no grating constant. Set K below anyway if you have it --
-it is the only independent check that no order was missed between the two
-Balmer lines, which is the one error the arithmetic cannot see.
+Set ALPHA, BETA and NAD to re-run the solve without clicking.
 """
 
 import os
@@ -51,9 +48,9 @@ SCIENCE_FILE = os.path.join(NIGHT, "Light", "Arcturus",
 # ----------------------------------------------------------------------
 # The cross-check
 # ----------------------------------------------------------------------
-# Grating constant K = 2 d sin(blaze), in Angstrom. Leave the two values
-# below as None to skip it -- the solve still works, it just has nothing
-# independent confirming the integer it lands on.
+# Grating constant K = 2 d sin(blaze), in Angstrom. Set both values to None
+# to skip the cross-check. The solve still works, but nothing then confirms
+# the integer it lands on.
 # BLAZE_ANGLE_DEG = config.BLAZE_ANGLE_DEG
 # GROOVE_DENSITY_MM = config.GROOVE_DENSITY_MM
 BLAZE_ANGLE_DEG = None
@@ -67,9 +64,8 @@ DIRECTION_GUESS = -1
 # ----------------------------------------------------------------------
 # Already know where the lines are?
 # ----------------------------------------------------------------------
-# Fill these in to skip the clicking entirely and just re-run the solve --
-# useful for checking a change, or for re-deriving after the tracer picks up
-# a different number of orders. Format:
+# Fill these in to skip the clicking and re-run the solve directly, for
+# example after the tracer picks up a different number of orders. Format:
 #   ALPHA = (trace_index, pixel)
 #   BETA  = (trace_index, pixel)
 #   NAD   = (trace_index, pixel_of_D2_5889.95, pixel_of_D1_5895.92)
@@ -89,8 +85,8 @@ n_pixels = white.shape[0]
 
 print("\nChecking the trace list for a missing order:")
 ws.check_trace_spacing(orders)
-print("  A missed order BETWEEN the two Balmer lines is the one thing that "
-      "breaks this, so read the above before trusting the result.\n")
+print("  A missed order between the two Balmer lines breaks the solve, so "
+      "read the above before trusting the result.\n")
 
 print("Extracting the science spectrum along every trace ...")
 science = frames.read_image(SCIENCE_FILE)

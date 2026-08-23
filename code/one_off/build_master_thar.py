@@ -1,18 +1,14 @@
-"""
-build_master_thar.py
+"""Build a master wavelength solution for one instrument configuration.
 
-Building a master wavelength solution from one night's white-light flats,
-one arc, and one science frame.
+The build takes one night's white-light flats, one arc frame and one
+science frame, and is interactive. It is run once per configuration, from
+make_master_thar.py; later nights go through reduce_spectra.py, which
+registers this result onto new data. The result describes the instrument
+rather than the night: a smooth surface giving m*lambda over (pixel,
+order number), plus the map from detector position to order number used
+to identify later traces.
 
-This is the expensive, interactive, once-per-instrument-configuration step.
-Run it from make_master_thar.py. Everything after it -- every other night,
-every science frame -- goes through reduce_spectra.py instead, which only
-ever registers this result onto new data.
-
-The solution it produces is not tied to the night it was built from. It is a
-description of the instrument: one smooth surface giving m*lambda over
-(pixel, order number), plus the map from position on the detector to order
-number that lets any later night's traces be identified against it.
+Main entry point: build_master.
 """
 
 import os
@@ -29,15 +25,34 @@ from order_tracing import trace_orders
 
 
 def click_nad_pixels(orders, guesses=None):
-    """Pixel positions of the two Na D lines in the seed order.
+    """Locate the two Na D lines in the seed order.
 
-    Clicking beats fitting here. In a spectrum as line-rich as Arcturus
-    nothing automatic can know which deep line you meant, and the whole
-    dispersion seed rests on getting that right. You only need to land
-    within about 15 px; a Gaussian does the rest.
+    The lines are clicked rather than found automatically because in a
+    line-rich spectrum only the operator knows which deep line is meant,
+    and the dispersion seed rests on that. A click need only land within
+    about 15 pixels of the line; a Gaussian fit supplies the centre.
 
-    Pass `guesses` (from a previous run's printed hint) to skip the clicking
-    and re-centroid at those positions instead.
+    Parameters
+    ----------
+    orders : list of Order
+        Traced orders carrying science_spectrum. The seed order is
+        orders[config.NAD_TRACE].
+    guesses : sequence of float, optional
+        Approximate pixel positions of the two lines, in the order of
+        config.NAD_LINES, re-centroided instead of clicked. Default
+        None, meaning the lines are clicked and the positions found are
+        printed for reuse.
+
+    Returns
+    -------
+    pixels : list of float
+        Refined pixel positions of the two Na D lines, in the order of
+        config.NAD_LINES.
+
+    Raises
+    ------
+    RuntimeError
+        If a line is not clicked; the seed needs both.
     """
     order = orders[config.NAD_TRACE]
     if guesses is not None:
@@ -49,7 +64,7 @@ def click_nad_pixels(orders, guesses=None):
     pixels = []
     for wave, name in config.NAD_LINES:
         pixel = ws.click_line(order.science_spectrum,
-                              f"{name} ({wave} A) -- trace {config.NAD_TRACE}",
+                              f"{name} ({wave} A), trace {config.NAD_TRACE}",
                               window=15)
         if pixel is None:
             raise RuntimeError(f"{name} was not clicked; the seed needs both lines")
@@ -68,7 +83,8 @@ def _write_summary(path, solution, orders, report, sources, shift_note):
         f"arc frame        {sources['arc']}",
         f"science frame    {sources['science']}",
         f"orders traced    {max(numbers)} down to {min(numbers)}",
-        f"orders fitted    {solution.m_max:.0f} down to {solution.m_min:.0f}"  # the rest still get an axis from the shared surface
+        # orders outside this range still get an axis from the surface
+        f"orders fitted    {solution.m_max:.0f} down to {solution.m_min:.0f}"
         ,
         f"camera focal     {solution.focal_pixels:.0f} px",
         "",
@@ -85,9 +101,52 @@ def _write_summary(path, solution, orders, report, sources, shift_note):
 def build_master(white_loc, arc_file, science_file, nad_pixel_guesses=None,
                  halpha_pixel_guess=None, hbeta_pixel_guess=None,
                  master_path=None, save=True, plot=True):
-    """Derive a master solution and, if it passes every check, save it.
+    """Derive a master wavelength solution and save it if it passes.
 
-    Returns (solution, report, orders).
+    The orders are traced from the flats, the arc and science spectra
+    are extracted, order numbers are assigned, the dispersion is seeded
+    from the Na D doublet, atlas lines are matched and a surface is
+    fitted and assessed. Halpha, Hbeta and the Na D lines take no part
+    in the fit, so they serve as an independent check on the science
+    frame's shift from the arc. The solution is written, summarised and
+    archived only if every quality check passed.
+
+    Parameters
+    ----------
+    white_loc : str
+        Directory of white-light flat FITS files.
+    arc_file : str
+        Path to the arc frame.
+    science_file : str
+        Path to the science frame used for the stellar checks.
+    nad_pixel_guesses : sequence of float, optional
+        Approximate pixel positions of the two Na D lines, which skip
+        the clicking step. Default None, meaning the lines are clicked.
+    halpha_pixel_guess : float, optional
+        Approximate pixel position of Halpha in its anchor trace, used
+        for the independent shift check. Default None, meaning Halpha is
+        left out of that check.
+    hbeta_pixel_guess : float, optional
+        As halpha_pixel_guess, for Hbeta. Default None.
+    master_path : str, optional
+        Path to save the solution to. Default None, meaning
+        config.MASTER_PATH.
+    save : bool, optional
+        Save, summarise and archive a solution that passes every check.
+        Default True.
+    plot : bool, optional
+        Show the calibrated orders at the end. Default True.
+
+    Returns
+    -------
+    solution : WavelengthSolution
+        The fitted surface and the order number map.
+    report : QualityReport
+        The checks measured on the solution and whether all passed.
+    orders : list of Order
+        The traced orders, mutated in place: the extracted spectra,
+        order numbers, wavelength axes and matched lines are set on
+        them.
     """
     master_path = master_path or config.MASTER_PATH
 
@@ -197,7 +256,7 @@ def build_master(white_loc, arc_file, science_file, nad_pixel_guesses=None,
         print(f"  archived as {os.path.basename(archive)}")
     elif not report.passed:
         print("NOT saving: the solution failed at least one check above. Fix the cause "
-              "rather than loosening the threshold -- the checks are the only thing "
+              "rather than loosening the threshold. The checks are the only thing "
               "standing between a wrong wavelength axis and your science.")
 
     if plot:

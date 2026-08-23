@@ -1,69 +1,24 @@
-"""
-wavelength_solution.py
+"""Wavelength calibration for an echelle spectrograph.
 
-The wavelength model, and everything that fits or judges one. Building a
-master lives in build_master_thar.py, reusing one in reduce_spectra.py;
-both are built out of what is here.
+The module holds the wavelength model and the routines that fit, judge,
+save and reuse one. The model works in m * lambda, the product of echelle
+order number and wavelength, because a single smooth function of detector
+row describes that product for every order at once. A low-degree Chebyshev
+correction in (pixel, order number) is fitted on top of it.
 
-Every class that ends up inside a saved master is defined in THIS module on
-purpose. Pickle records the module a class came from and looks it up by
-that name when loading, so moving one of these elsewhere would quietly
-break every master already written.
+Every class that ends up inside a saved master is defined in this module,
+because pickle resolves a class by the module it was defined in.
 
-The whole module is built on one idea: for a grating spectrograph the
-quantity that behaves simply is not the wavelength, it is the product
+Main entry points
+-----------------
+assign_order_numbers : label traced orders with the order number m.
+seed_from_doublet : build a linear seed from one clicked doublet.
+lock_seed : refine the seed against the atlas, all orders at once.
+solve : alternate matching and fitting to reach the final solution.
+assess : run the quality checks and return a QualityReport.
+save_solution, load_solution : write and read a master solution.
 
-    m * lambda
-
-Along a single order the grating equation says
-
-    m * lambda = d * (sin(alpha) + sin(beta))
-
-with alpha (incidence) fixed by the instrument, and beta (diffraction
-angle) set purely by where the light lands on the detector. Every order
-is imaged by the same camera, so beta is the same function of detector
-row for all of them. That means a SINGLE smooth curve
-
-    m * lambda(y) = a0 + (a1 * u + a2 * f) / sqrt(f**2 + u**2),   u = y - y_centre
-
-describes every order at once: f is the camera focal length in pixels,
-and the sqrt() is just tan->sin for the camera's mapping of row to angle.
-The only order-to-order freedom left is the small out-of-plane (cos gamma)
-term and any detector rotation, which enter as a slowly varying function
-of m -- here a low-degree polynomial multiplying each of the three basis
-terms.
-
-Two things follow, and they are the reason this module is shaped the way
-it is:
-
-  * Orders cannot disagree at their overlaps. Adjacent orders are not
-    fitted separately and then hoped to agree; they are two evaluations
-    of one surface. Overlap agreement becomes a measurement of how good
-    the surface is, not something to be patched up afterwards.
-
-  * The model extrapolates honestly. A high-degree polynomial fitted to
-    the pixel range where ThAr lines happen to be dense goes wild outside
-    it. This basis is the actual optics, so the ends of each order stay
-    sane even before lines are matched there -- which is what lets the
-    line matching reach the ends at all (see solve()).
-
-A small Chebyshev correction in (pixel, order) is fitted on top to absorb
-whatever the idealised optics misses. It is deliberately low degree so it
-cannot undo the good extrapolation behaviour.
-
-The pipeline:
-
-    1. order numbers          assign_order_numbers()   -- from Halpha/Hbeta
-    2. seed dispersion        seed_from_doublet()      -- from clicked Na D
-    3. global lock            lock_seed()              -- template correlation
-                                                          of every order at
-                                                          once against the atlas
-    4. iterative solve        solve()                  -- match, fit, tighten
-    5. quality gate           assess()                 -- CV + overlap + trends
-    6. save                    save_solution()
-    7. reuse                   reduce_spectra.reduce_science()
-
-Nothing here touches order tracing or extraction; that is order_tracing.py.
+Order tracing and extraction are in order_tracing.py.
 """
 
 import pickle
@@ -84,29 +39,58 @@ C_LIGHT_MS = 299792458.0
 # ======================================================================
 
 def compute_grating_K(blaze_angle_deg, groove_density_mm):
-    """Littrow grating constant K, in Angstrom, such that m * lambda ~ K at
-    the blaze peak: K = 2 * d * sin(blaze), d = groove spacing.
+    """Return the Littrow grating constant K, in Angstrom.
 
-    Used only as a starting guess and as a sanity check on the fitted
-    solution -- nothing downstream depends on it being exactly right.
+    K = 2 * d * sin(blaze), with d the groove spacing, so that
+    m * lambda is close to K at the blaze peak. Used as a starting guess
+    and as a sanity check on the fitted solution.
+
+    Parameters
+    ----------
+    blaze_angle_deg : float
+        Blaze angle in degrees.
+    groove_density_mm : float
+        Groove density in grooves per mm.
+
+    Returns
+    -------
+    K : float
+        Grating constant in Angstrom.
     """
     d_angstrom = 1e7 / groove_density_mm
     return 2.0 * d_angstrom * np.sin(np.deg2rad(blaze_angle_deg))
 
 
 def assign_order_numbers(orders, K, anchors, direction):
-    """Give every traced order its physical echelle order number m.
+    """Assign the physical echelle order number m to every traced order.
 
-    anchors : list of (trace_index, rest_wavelength) for lines whose order
-        you are confident about -- Halpha and Hbeta. Each anchor gives
-        m ~ K / lambda; rounding that to an integer and stepping back to
-        trace index 0 gives m0. Two anchors far apart in trace index is a
-        strong test: they must agree on m0, and the number of orders
-        between them must equal the difference in their order numbers.
+    Each anchor gives m = K / lambda; rounding that to an integer and
+    stepping back to trace index 0 gives m0. Anchors far apart in trace
+    index must agree on m0. Sets order_number on every element of orders
+    in place.
 
-    direction : +1 or -1 in m_i = m0 + direction * i.
+    Parameters
+    ----------
+    orders : list
+        Traced orders in trace index order. Each element gains an integer
+        order_number attribute.
+    K : float
+        Grating constant in Angstrom.
+    anchors : list of tuple
+        (trace_index, rest_wavelength) for lines of known order, with the
+        wavelength in Angstrom.
+    direction : int
+        Sign in m_i = m0 + direction * i; +1 or -1.
 
-    Returns m0. Mutates orders in place.
+    Returns
+    -------
+    m0 : int
+        Order number of trace index 0.
+
+    Raises
+    ------
+    ValueError
+        If the anchors imply different values of m0.
     """
     implied = []
     print("Order numbering from anchors:")
@@ -123,7 +107,7 @@ def assign_order_numbers(orders, K, anchors, direction):
             f"Anchors disagree on m0 ({implied}). Either the grating constant is wrong "
             f"for this configuration, `direction` has the wrong sign, or an order is "
             f"missing from the trace list between the two anchor traces (which would "
-            f"shift every trace index past it). Fix this before going any further -- "
+            f"shift every trace index past it). Fix this before going any further, "
             f"every wavelength downstream is built on it.")
 
     m0 = implied[0]
@@ -139,18 +123,27 @@ def assign_order_numbers(orders, K, anchors, direction):
 
 
 def check_trace_spacing(orders, tolerance=0.35):
-    """Warn if the spacing between adjacent traces suggests a MISSED order.
+    """Report gaps between adjacent traces that suggest a missed order.
 
-    Order numbering is 'm0 + direction * trace_index', so an order that the
-    tracer failed to pick up *between* two traced orders silently shifts
-    every order number past it by one and wrecks the solution. Missed
-    orders at the very blue or red end are harmless by comparison -- they
-    cost coverage, not correctness.
+    Order numbering is m0 + direction * trace_index, so an order missed
+    between two traced orders shifts every order number past it. The
+    separation between adjacent orders varies smoothly, so a gap wider
+    than 1 + tolerance times the local median is flagged. Prints a
+    warning for each suspicious gap.
 
-    The separation between adjacent orders on the detector varies smoothly,
-    so a gap that is far larger than its neighbours is the signature of a
-    missing order. Returns a list of trace indices after which a gap looks
-    suspicious (empty is what you want).
+    Parameters
+    ----------
+    orders : list
+        Traced orders, each with trace_center_pixel in pixels.
+    tolerance : float, optional
+        Fractional excess over the local median gap that counts as
+        suspicious. Default 0.35.
+
+    Returns
+    -------
+    bad : list of int
+        Trace indices after which the gap looks suspicious. Empty if the
+        spacing is smooth, and empty if fewer than six orders are given.
     """
     x = np.array([o.trace_center_pixel for o in orders], dtype=float)
     gaps = np.diff(x)
@@ -161,7 +154,7 @@ def check_trace_spacing(orders, tolerance=0.35):
     bad = np.where(ratio > 1.0 + tolerance)[0]
     for b in bad:
         print(f"  WARNING: gap between trace {b} (x={x[b]:.0f}) and {b + 1} (x={x[b + 1]:.0f}) "
-              f"is {gaps[b]:.0f} px, {ratio[b]:.2f}x the local trend -- an order may be "
+              f"is {gaps[b]:.0f} px, {ratio[b]:.2f}x the local trend, so an order may be"
               f"missing here, which would shift every order number past it.")
     if len(bad) == 0:
         print(f"  trace spacing is smooth across all {len(orders)} orders "
@@ -174,12 +167,21 @@ def check_trace_spacing(orders, tolerance=0.35):
 # ======================================================================
 
 class ReferenceLines:
-    """The subset of the atlas that is actually usable for calibration.
+    """Atlas lines usable for calibration, sorted by wavelength.
 
-    `wave` is the catalogue wavelength; `eff_wave` is the amplitude-weighted
+    wave is the catalogue wavelength; eff_wave is the amplitude-weighted
     centroid of everything the instrument blends into that line at its
-    resolution. A centroid measured on the detector measures the blend, so
-    `eff_wave` is what it should be compared against.
+    resolution, which is what a centroid measured on the detector should
+    be compared against.
+
+    Parameters
+    ----------
+    wave : ndarray
+        Catalogue wavelengths in Angstrom, shape (n,).
+    eff_wave : ndarray
+        Effective blend-weighted wavelengths in Angstrom, shape (n,).
+    amplitude : ndarray
+        Catalogue line amplitudes, shape (n,).
     """
 
     def __init__(self, wave, eff_wave, amplitude):
@@ -189,20 +191,36 @@ class ReferenceLines:
         self.amplitude = np.asarray(amplitude, float)[order]
 
     def __len__(self):
+        """Number of reference lines held."""
         return len(self.wave)
 
 
 def load_atlas(path, ion_prefix="Th", amplitude_min=10.0):
-    """Read a ThAr line list (the '|'-delimited NIST/Murphy format).
+    """Read a ThAr line list in the '|'-delimited NIST/Murphy format.
 
-    Ar lines are dropped by default. They are genuinely worse for precision
-    work -- more prone to blending, self-absorption and pressure shifts than
-    Th -- and with 15000 Th lines available there is no need for them.
+    Ar lines are dropped by default; they blend and shift more readily
+    than Th lines. The complete list is returned as well, because the
+    blend and dominance test needs the rejected lines too.
 
-    Returns (wave, amplitude, full_wave, full_amplitude): the selected lines,
-    plus the complete list, which is kept because the blend/dominance test
-    below has to know about the lines it is rejecting, not just the ones it
-    is keeping.
+    Parameters
+    ----------
+    path : str
+        Path to the line list.
+    ion_prefix : str, optional
+        Keep only ions whose name starts with this prefix. Default "Th".
+    amplitude_min : float, optional
+        Keep only lines with amplitude above this value. Default 10.0.
+
+    Returns
+    -------
+    wave : ndarray
+        Wavelengths of the selected lines, in Angstrom.
+    amplitude : ndarray
+        Amplitudes of the selected lines.
+    full_wave : ndarray
+        Wavelengths of every line in the file, in Angstrom.
+    full_amplitude : ndarray
+        Amplitudes of every line in the file.
     """
     atlas = pd.read_csv(path, delimiter="|")
     atlas.columns = [c.strip() for c in atlas.columns]
@@ -221,24 +239,36 @@ def load_atlas(path, ion_prefix="Th", amplitude_min=10.0):
 def select_reference_lines(sel_wave, sel_amp, full_wave, full_amp,
                            resolution_angstrom, amplitude_min=200.0,
                            dominance=5.0):
-    """Keep only lines that a spectrograph of this resolution can actually
-    measure without bias, and give each one an effective wavelength.
+    """Keep the atlas lines this resolution can measure without blend bias.
 
-    This matters more than it sounds. This atlas carries roughly four lines
-    per Angstrom in the blue while a resolution element is about a tenth of
-    an Angstrom, so most catalogue lines are unresolvable neighbours of a
-    stronger one. Matching a measured centroid to whichever catalogue entry
-    happens to be nearest then pulls the fit around by an amount that
-    depends on the local blend -- a systematic that looks like noise and
-    does not average away.
+    A line survives if it is one of the pre-selected lines, its amplitude
+    exceeds amplitude_min, and its amplitude exceeds dominance times the
+    summed amplitude of every other line within one resolution width.
+    Each survivor is given an effective wavelength, the amplitude-weighted
+    centroid of that whole group.
 
-    A line survives if it is strong (`amplitude_min`) and dominates its own
-    resolution element: its amplitude must exceed `dominance` times the sum
-    of every other line within one resolution width. What survives gets an
-    effective wavelength, the amplitude-weighted centroid of that whole
-    group, which is what the detector actually sees.
+    Parameters
+    ----------
+    sel_wave : ndarray
+        Wavelengths in Angstrom of the pre-selected lines.
+    sel_amp : ndarray
+        Amplitudes of the pre-selected lines.
+    full_wave : ndarray
+        Wavelengths in Angstrom of every atlas line, sorted ascending.
+    full_amp : ndarray
+        Amplitudes of every atlas line.
+    resolution_angstrom : callable
+        Maps wavelength in Angstrom to resolution width in Angstrom.
+    amplitude_min : float, optional
+        Least amplitude of a surviving line. Default 200.0.
+    dominance : float, optional
+        Required ratio of a line's amplitude to the summed amplitude of
+        its neighbours within one resolution width. Default 5.0.
 
-    resolution_angstrom : callable lambda -> resolution width in Angstrom.
+    Returns
+    -------
+    ref : ReferenceLines
+        The surviving lines with their effective wavelengths.
     """
     w = np.asarray(full_wave, float)
     a = np.asarray(full_amp, float)
@@ -279,12 +309,34 @@ DET_PIXEL, DET_SIGMA, DET_AMP, DET_SNR, DET_PIXERR, DET_FITRES = range(6)
 
 def reference_lines_for(atlas_path, m_lambda_centre, m_lambda_half_range, n_pixels,
                         line_sigma_pixels, amplitude_min=200.0, dominance=5.0):
-    """Load the atlas and keep the lines this instrument can actually use.
+    """Load the atlas and keep the lines this instrument can use.
 
-    Needs a rough idea of the dispersion, because how isolated a line has to
-    be depends on what the spectrograph can separate, and that width scales
-    with wavelength. A seed provides it when building; the saved surface
-    provides it when applying.
+    The isolation test needs the resolution width, which is derived from
+    the approximate dispersion implied by m_lambda_centre and
+    m_lambda_half_range. A seed supplies those when building a solution,
+    the saved surface when applying one.
+
+    Parameters
+    ----------
+    atlas_path : str
+        Path to the ThAr line list.
+    m_lambda_centre : float
+        m * lambda at the centre of the detector, in Angstrom.
+    m_lambda_half_range : float
+        Half the span of m * lambda across the detector, in Angstrom.
+    n_pixels : int
+        Number of pixels along an order.
+    line_sigma_pixels : float
+        Instrumental line profile sigma, in pixels.
+    amplitude_min : float, optional
+        Least amplitude of a surviving line. Default 200.0.
+    dominance : float, optional
+        Required amplitude ratio over blend neighbours. Default 5.0.
+
+    Returns
+    -------
+    ref : ReferenceLines
+        The usable atlas lines with effective wavelengths.
     """
     sel_wave, sel_amp, full_wave, full_amp = load_atlas(atlas_path)
     fwhm_pixels = 2.355 * line_sigma_pixels
@@ -304,23 +356,44 @@ def detect_arc_lines(spectrum, expected_sigma_pixels=3.3, detection_sigma=7.0,
                      continuum_window=201):
     """Find ThAr emission lines in one extracted order and centroid them.
 
-    Everything here exists to make sure a line that reaches the fit is one
-    whose centroid means what it says. Rejected outright:
+    Peaks are found above a median-filtered continuum and fitted with a
+    Gaussian. A line is rejected if it reaches saturation, if its fitted
+    sigma falls outside width_tolerance times expected_sigma_pixels, or
+    if the RMS of the fit residual exceeds max_fit_residual as a fraction
+    of the amplitude. Each of those biases the centroid.
 
-      * saturated lines -- the profile is clipped, so the centroid is
-        biased by however the clipping happens to be distributed. In the
-        red these are the brightest lines, and keeping them at reduced
-        weight (rather than dropping them) is a false economy: they bias
-        the fit in exactly the orders where there are fewest other lines
-        to outvote them.
-      * lines much narrower or wider than the instrumental profile -- a
-        cosmic ray or an unresolved blend, respectively.
-      * lines whose Gaussian fit leaves large structured residuals -- an
-        asymmetric blend, whose centroid is pulled off the true line.
+    Parameters
+    ----------
+    spectrum : ndarray
+        Extracted arc spectrum of one order, shape (n_pixels,).
+    expected_sigma_pixels : float, optional
+        Instrumental line sigma in pixels, used as the fit starting value
+        and as the width reference. Default 3.3.
+    detection_sigma : float, optional
+        Peak prominence threshold, in units of the robust noise.
+        Default 7.0.
+    saturation : float, optional
+        Counts at or above which a peak is discarded. Default 45000.0.
+    min_separation : int, optional
+        Least separation between detected peaks, in pixels. Default 8.
+    half_window : int, optional
+        Half width of the fitting window, in pixels. Default 9.
+    width_tolerance : tuple of float, optional
+        Lower and upper multiples of expected_sigma_pixels that a fitted
+        sigma must lie between. Default (0.5, 2.0).
+    max_fit_residual : float, optional
+        Largest allowed RMS fit residual, as a fraction of the line
+        amplitude. Default 0.15.
+    continuum_window : int, optional
+        Median filter width used for the continuum, in pixels.
+        Default 201.
 
-    Returns an (n, 6) array of columns
-    (pixel, sigma, amplitude, snr, pixel_error, fractional_fit_residual),
-    or None if the spectrum has non-finite values (a dead trace).
+    Returns
+    -------
+    detections : ndarray or None
+        Shape (n, 6), columns (pixel, sigma in pixels, amplitude, signal
+        to noise, pixel error, fractional fit residual). Shape (0, 6) if
+        no line survives. None if the spectrum has non-finite values.
     """
     s = np.asarray(spectrum, float)
     if not np.all(np.isfinite(s)):
@@ -374,11 +447,24 @@ def detect_arc_lines(spectrum, expected_sigma_pixels=3.3, detection_sigma=7.0,
 
 
 def detect_all_orders(orders, **kwargs):
-    """Run detect_arc_lines over every order's extracted ThAr spectrum.
+    """Run detect_arc_lines on every order's extracted ThAr spectrum.
 
-    Returns a list parallel to `orders` (None for dead/blank traces) and
-    prints a one-line summary, since a sudden collapse in the number of
-    lines found is the first sign something is wrong with the extraction.
+    Prints a summary of the line counts, since a collapse in the number
+    found is the first sign of a bad extraction.
+
+    Parameters
+    ----------
+    orders : list
+        Traced orders, each with a thar_spectrum attribute holding an
+        ndarray or None.
+    **kwargs
+        Passed through to detect_arc_lines.
+
+    Returns
+    -------
+    detections : list
+        One entry per order, each an (n, 6) detection array, or None for
+        a dead or blank trace.
     """
     detections = []
     n_total = 0
@@ -406,19 +492,37 @@ def detect_all_orders(orders, **kwargs):
 # ======================================================================
 
 class WavelengthSolution:
-    """pixel, order number -> wavelength, for the whole detector at once.
+    """Maps (pixel, order number) to wavelength for the whole detector.
 
-    m * lambda = [physical camera terms] x [low-degree polynomial in m]
-                 + [small Chebyshev correction in (pixel, m)]
+    m * lambda is modelled as three physical camera terms, 1, u / d and
+    f / d with u = pixel - pixel_centre and d = sqrt(f**2 + u**2), which
+    are the constant, sin(beta) and cos(beta) of a camera of focal length
+    f pixels. Each term carries its own low-degree polynomial in
+    normalised order number, covering the out-of-plane cos(gamma) term
+    and any detector rotation. An optional Chebyshev correction in
+    (pixel, order number) is added to that.
 
-    The three physical terms are 1, u/sqrt(f^2+u^2) and f/sqrt(f^2+u^2)
-    with u = pixel - pixel_centre: constant, sin(beta) and cos(beta) for a
-    camera of focal length f pixels. Each is allowed its own low-degree
-    polynomial in normalised order number, which covers the out-of-plane
-    cos(gamma) term and any detector rotation.
+    Defined at module level so that it survives pickling into a saved
+    master solution.
 
-    Module-level class on purpose: it has to survive pickling into the
-    saved master solution, which a closure would not.
+    Parameters
+    ----------
+    focal_pixels : float
+        Camera focal length, in pixels.
+    coefficients : ndarray
+        Physical-term coefficients, shape (3 * (m_degree + 1),).
+    m_degree : int
+        Degree of the polynomial in normalised order number.
+    n_pixels : int
+        Number of pixels along an order.
+    m_min : float
+        Lowest order number, used to normalise m.
+    m_max : float
+        Highest order number, used to normalise m.
+    correction : ndarray, optional
+        Chebyshev coefficients in (pixel, order number), shape
+        (degree_pixel + 1, degree_m + 1). Default None, meaning no
+        correction term is applied.
     """
 
     def __init__(self, focal_pixels, coefficients, m_degree, n_pixels,
@@ -441,7 +545,20 @@ class WavelengthSolution:
         return (np.asarray(m, float) - mid) / half
 
     def design(self, pixel, m):
-        """Design matrix of the physical part, shape (n, 3 * (m_degree + 1))."""
+        """Design matrix of the physical part of the model.
+
+        Parameters
+        ----------
+        pixel : ndarray
+            Pixel positions along the order, shape (n,).
+        m : ndarray
+            Order number of each position, shape (n,).
+
+        Returns
+        -------
+        matrix : ndarray
+            Shape (n, 3 * (m_degree + 1)).
+        """
         u = np.asarray(pixel, float) - (self.n_pixels - 1) / 2.0
         d = np.sqrt(self.focal_pixels ** 2 + u ** 2)
         basis = np.vstack([np.ones_like(u), u / d, self.focal_pixels / d])
@@ -451,6 +568,20 @@ class WavelengthSolution:
 
     # -- evaluation --------------------------------------------------
     def m_lambda(self, pixel, m):
+        """Order number times wavelength, in Angstrom.
+
+        Parameters
+        ----------
+        pixel : ndarray or float
+            Position along the order, in pixels.
+        m : ndarray or float
+            Order number, broadcast against pixel.
+
+        Returns
+        -------
+        m_lambda : ndarray
+            m * wavelength in Angstrom, shape of the broadcast inputs.
+        """
         pixel = np.asarray(pixel, float)
         m = np.asarray(m, float)
         pixel, m = np.broadcast_arrays(pixel, m)
@@ -462,37 +593,103 @@ class WavelengthSolution:
         return value.reshape(pixel.shape)
 
     def wavelength(self, pixel, m):
+        """Wavelength in Angstrom at a pixel in a given order.
+
+        Parameters
+        ----------
+        pixel : ndarray or float
+            Position along the order, in pixels.
+        m : ndarray or float
+            Order number, broadcast against pixel.
+
+        Returns
+        -------
+        wavelength : ndarray
+            Wavelength in Angstrom, shape of the broadcast inputs.
+        """
         pixel = np.asarray(pixel, float)
         m = np.asarray(m, float)
         pixel, m = np.broadcast_arrays(pixel, m)
         return self.m_lambda(pixel, m) / m
 
     def dispersion(self, pixel, m):
-        """Angstrom per pixel at (pixel, m)."""
+        """Local dispersion, in Angstrom per pixel.
+
+        Parameters
+        ----------
+        pixel : ndarray or float
+            Pixel position along the order.
+        m : ndarray or float
+            Order number.
+
+        Returns
+        -------
+        dispersion : ndarray
+            Signed Angstrom per pixel at (pixel, m), measured over one pixel
+            centred on it.
+        """
         pixel = np.asarray(pixel, float)
         return (self.wavelength(pixel + 0.5, m) - self.wavelength(pixel - 0.5, m))
 
     def order_axis(self, m, n_pixels=None):
-        """The full wavelength axis of one order."""
+        """Wavelength axis of one whole order.
+
+        Parameters
+        ----------
+        m : float
+            Order number.
+        n_pixels : int, optional
+            Number of pixels to evaluate. Default None, meaning the
+            solution's own n_pixels.
+
+        Returns
+        -------
+        wavelength : ndarray
+            Wavelength in Angstrom at each pixel, shape (n_pixels,).
+        """
         n = self.n_pixels if n_pixels is None else n_pixels
         pix = np.arange(n)
         return self.wavelength(pix, np.full(n, float(m)))
 
     def for_order(self, m):
-        """A one-argument callable pixel -> wavelength for a single order,
-        so per-order code (plots, extraction, the saved solution) can hold
-        something that behaves like the old per-order polynomial."""
+        """Return a one-argument callable pixel -> wavelength for one order.
+
+        Lets per-order code hold something that behaves like a per-order
+        polynomial.
+
+        Parameters
+        ----------
+        m : float
+            Order number.
+
+        Returns
+        -------
+        axis : OrderWavelength
+            Callable, picklable slice of this solution.
+        """
         return OrderWavelength(self, m)
 
 
 class OrderWavelength:
     """One order's slice of a WavelengthSolution. Picklable and callable.
 
-    pixel_shift moves the axis across the detector -- the right correction
-    for flexure, and the wrong one for anything Doppler. velocity_ms scales
-    it instead, which is the right correction for a Doppler shift and, being
-    the same fraction in every order, cannot disturb order overlap. See
-    diagnose_frame_offset for which one an exposure needs.
+    pixel_shift moves the axis across the detector, which is the
+    correction for flexure. velocity_ms scales the axis instead, which is
+    the correction for a Doppler shift and, being the same fraction in
+    every order, cannot disturb order overlap. diagnose_frame_offset
+    says which of the two an exposure needs.
+
+    Parameters
+    ----------
+    solution : WavelengthSolution
+        Surface to slice.
+    m : float
+        Order number.
+    pixel_shift : float, optional
+        Shift subtracted from the pixel coordinate, in pixels.
+        Default 0.0.
+    velocity_ms : float, optional
+        Velocity in m/s divided out of the wavelength. Default 0.0.
     """
 
     def __init__(self, solution, m, pixel_shift=0.0, velocity_ms=0.0):
@@ -502,6 +699,19 @@ class OrderWavelength:
         self.velocity_ms = float(velocity_ms)
 
     def __call__(self, pixel):
+        """Wavelength in Angstrom at a pixel in this order.
+
+        Parameters
+        ----------
+        pixel : ndarray or float
+            Position along the order, in pixels.
+
+        Returns
+        -------
+        wavelength : ndarray
+            Wavelength in Angstrom, with pixel_shift and velocity_ms
+            applied, same shape as pixel.
+        """
         pixel = np.asarray(pixel, float) - self.pixel_shift
         w = self.solution.wavelength(pixel, np.full(pixel.shape, self.m))
         return w / (1.0 + self.velocity_ms / C_LIGHT_MS)
@@ -510,12 +720,22 @@ class OrderWavelength:
 class PolynomialSurface:
     """m * lambda as a plain Chebyshev surface in (pixel, order number).
 
-    Used only to warm the solution up. It is well conditioned at low degree
-    and does not care how bad the starting matches are, which is what the
-    first couple of passes need. It is a poor final model -- outside the
-    pixel range where lines happened to be matched it does whatever a
-    polynomial does -- so solve() hands over to WavelengthSolution as soon
-    as there are enough matches to pin the camera geometry down.
+    Used only to warm the solution up. It is well conditioned at low
+    degree and tolerates bad starting matches, but it extrapolates poorly
+    outside the pixel range where lines were matched, so solve() hands
+    over to WavelengthSolution once there are enough matches to pin the
+    camera geometry down.
+
+    Parameters
+    ----------
+    coefficients : ndarray
+        Chebyshev coefficients, shape (degree_pixel + 1, degree_m + 1).
+    n_pixels : int
+        Number of pixels along an order.
+    m_min : float
+        Lowest order number, used to normalise m.
+    m_max : float
+        Highest order number, used to normalise m.
     """
 
     def __init__(self, coefficients, n_pixels, m_min, m_max):
@@ -533,20 +753,88 @@ class PolynomialSurface:
         return (np.asarray(m, float) - mid) / half
 
     def m_lambda(self, pixel, m):
+        """Order number times wavelength, in Angstrom.
+
+        Parameters
+        ----------
+        pixel : ndarray or float
+            Position along the order, in pixels.
+        m : ndarray or float
+            Order number, broadcast against pixel.
+
+        Returns
+        -------
+        m_lambda : ndarray
+            m * wavelength in Angstrom.
+        """
         pixel, m = np.broadcast_arrays(np.asarray(pixel, float), np.asarray(m, float))
         return C.chebval2d(self._y_hat(pixel), self._m_hat(m), self.coefficients)
 
     def wavelength(self, pixel, m):
+        """Wavelength in Angstrom at a pixel in a given order.
+
+        Parameters
+        ----------
+        pixel : ndarray or float
+            Position along the order, in pixels.
+        m : ndarray or float
+            Order number, broadcast against pixel.
+
+        Returns
+        -------
+        wavelength : ndarray
+            Wavelength in Angstrom.
+        """
         pixel, m = np.broadcast_arrays(np.asarray(pixel, float), np.asarray(m, float))
         return self.m_lambda(pixel, m) / m
 
     def dispersion(self, pixel, m):
+        """Local dispersion, in Angstrom per pixel.
+
+        Parameters
+        ----------
+        pixel : ndarray or float
+            Position along the order, in pixels.
+        m : ndarray or float
+            Order number, broadcast against pixel.
+
+        Returns
+        -------
+        dispersion : ndarray
+            Angstrom per pixel, from the difference across one pixel.
+        """
         pixel = np.asarray(pixel, float)
         return self.wavelength(pixel + 0.5, m) - self.wavelength(pixel - 0.5, m)
 
 
 def fit_polynomial_surface(matches, n_pixels, degrees, clip_sigma=4.0, iterations=4):
-    """Robust weighted least squares for the warm-up surface."""
+    """Fit the warm-up surface by robust weighted least squares.
+
+    Parameters
+    ----------
+    matches : MatchSet
+        Matched lines to fit.
+    n_pixels : int
+        Number of pixels along an order.
+    degrees : tuple of int
+        Chebyshev degrees in (pixel, order number).
+    clip_sigma : float, optional
+        Residuals beyond this many robust sigma are rejected on the next
+        iteration. Default 4.0.
+    iterations : int, optional
+        Largest number of clip and refit iterations. Default 4.
+
+    Returns
+    -------
+    solution : PolynomialSurface
+        The fitted surface.
+    keep : ndarray
+        Boolean mask over matches of the lines that survived clipping,
+        shape (len(matches),).
+    residuals : ndarray
+        Residual in m * lambda for every match, in Angstrom, shape
+        (len(matches),).
+    """
     keep = np.ones(len(matches), bool)
     solution = None
     residuals = np.zeros(len(matches))
@@ -571,10 +859,20 @@ def fit_polynomial_surface(matches, n_pixels, degrees, clip_sigma=4.0, iteration
 
 
 class LinearSeed:
-    """m * lambda = A + B * y_hat -- the starting guess only.
+    """Starting guess m * lambda = A + B * y_hat, shared by every order.
 
-    Deliberately the simplest thing that can be pinned down from a single
-    clicked doublet, and never used past the first matching pass.
+    y_hat runs from -1 at pixel 0 to +1 at the last pixel. This is the
+    simplest model that a single clicked doublet pins down, and it is not
+    used past the first matching pass.
+
+    Parameters
+    ----------
+    A : float
+        Zero point of m * lambda, in Angstrom.
+    B : float
+        Half the span of m * lambda across the detector, in Angstrom.
+    n_pixels : int
+        Number of pixels along an order.
     """
 
     def __init__(self, A, B, n_pixels):
@@ -586,14 +884,60 @@ class LinearSeed:
         return 2.0 * (np.asarray(pixel, float) - (self.n_pixels - 1) / 2.0) / (self.n_pixels - 1)
 
     def m_lambda(self, pixel, m):
+        """Order number times wavelength, in Angstrom.
+
+        The value does not depend on m, since the seed is one line shared
+        by every order. m is accepted so the seed can stand in for a
+        fitted solution.
+
+        Parameters
+        ----------
+        pixel : ndarray or float
+            Position along the order, in pixels.
+        m : ndarray or float
+            Order number, used only for broadcasting.
+
+        Returns
+        -------
+        m_lambda : ndarray
+            A + B * y_hat, in Angstrom.
+        """
         pixel, m = np.broadcast_arrays(np.asarray(pixel, float), np.asarray(m, float))
         return self.A + self.B * self._y_hat(pixel)
 
     def wavelength(self, pixel, m):
+        """Wavelength in Angstrom at a pixel in a given order.
+
+        Parameters
+        ----------
+        pixel : ndarray or float
+            Position along the order, in pixels.
+        m : ndarray or float
+            Order number, broadcast against pixel.
+
+        Returns
+        -------
+        wavelength : ndarray
+            Wavelength in Angstrom.
+        """
         pixel, m = np.broadcast_arrays(np.asarray(pixel, float), np.asarray(m, float))
         return self.m_lambda(pixel, m) / m
 
     def dispersion(self, pixel, m):
+        """Local dispersion, in Angstrom per pixel.
+
+        Parameters
+        ----------
+        pixel : ndarray or float
+            Position along the order, in pixels.
+        m : ndarray or float
+            Order number, broadcast against pixel.
+
+        Returns
+        -------
+        dispersion : ndarray
+            Angstrom per pixel, from the difference across one pixel.
+        """
         return self.wavelength(np.asarray(pixel, float) + 0.5, m) - \
                self.wavelength(np.asarray(pixel, float) - 0.5, m)
 
@@ -603,23 +947,41 @@ class LinearSeed:
 # ======================================================================
 
 def seed_from_doublet(pixels, wavelengths, m, n_pixels, K=None):
-    """Turn one clicked doublet in one order into a seed for EVERY order.
+    """Turn one clicked doublet in one order into a seed for every order.
 
-    Two lines of known wavelength at known pixels in order m give the local
-    dispersion, and because m * lambda is a shared function of pixel, that
-    single measurement fixes the linear seed for the whole detector:
+    Two lines of known wavelength at known pixels in order m give the
+    local dispersion, and because m * lambda is a shared function of
+    pixel that single measurement fixes the linear seed for the whole
+    detector:
 
-        B = m * (dlambda/dy) * (n_pixels - 1) / 2      (slope, shared)
-        A = m * lambda_1 - B * y_hat(pixel_1)          (zero point, shared)
+        B = m * (dlambda/dy) * (n_pixels - 1) / 2
+        A = m * lambda_1 - B * y_hat(pixel_1)
 
-    The Na D doublet is a good choice: 5.97 A apart, both deep, and the two
-    components cannot be confused with each other. Fitting for them in a
-    star as line-rich as Arcturus is harder than just pointing at them,
-    which is why this takes clicked positions.
+    Parameters
+    ----------
+    pixels : ndarray
+        The two measured line positions, in pixels.
+    wavelengths : ndarray
+        The two rest wavelengths, in Angstrom.
+    m : int
+        Order number the two lines were measured in.
+    n_pixels : int
+        Number of pixels along an order.
+    K : float, optional
+        Nominal grating constant in Angstrom, used only to report how far
+        the seed zero point lands from it. Default None, meaning that
+        comparison is not printed.
 
-    K, if given, is only used to report how far the seed lands from the
-    nominal grating constant -- a large disagreement means a misclick or
-    the wrong order number, and is worth seeing before anything else runs.
+    Returns
+    -------
+    seed : LinearSeed
+        Linear seed for the whole detector.
+
+    Raises
+    ------
+    ValueError
+        If exactly two lines are not supplied, or if the two clicked
+        positions are less than 5 pixels apart.
     """
     pixels = np.asarray(pixels, float)
     wavelengths = np.asarray(wavelengths, float)
@@ -630,7 +992,7 @@ def seed_from_doublet(pixels, wavelengths, m, n_pixels, K=None):
     pixels, wavelengths = pixels[order], wavelengths[order]
     d_pixel = pixels[1] - pixels[0]
     if abs(d_pixel) < 5:
-        raise ValueError(f"clicked doublet is only {d_pixel:.1f} pixels apart -- "
+        raise ValueError(f"clicked doublet is only {d_pixel:.1f} pixels apart, "
                          f"that is almost certainly the same line clicked twice")
 
     dispersion = (wavelengths[1] - wavelengths[0]) / d_pixel   # A / pixel
@@ -654,25 +1016,56 @@ def seed_from_doublet(pixels, wavelengths, m, n_pixels, K=None):
 def lock_seed(detections, order_numbers, reference, seed, n_pixels,
               zero_point_range=3000.0, slope_fraction=0.06, n_slope=121,
               grid_step=1.0, expected_sigma_pixels=3.3, verbose=True):
-    """Refine the linear seed by correlating every order against the atlas
-    simultaneously, and report how convincingly it locked.
+    """Refine the linear seed against the atlas, all orders at once.
 
-    Why all orders at once. A single order carries perhaps thirty lines
-    against an atlas with thousands of candidates in reach, so its
-    correlation has plenty of near-ties -- this is exactly how a per-order
-    search ends up confidently wrong, and one wrong order poisons anything
-    fitted across orders. Here each order is correlated against its own
-    atlas window (order m's lines live at m * lambda, which is different for
-    every m, so this stays specific) and the correlations are SUMMED. The
-    true zero point is the one place where all ~80 orders agree, so it wins
-    by a margin nothing else can fake.
+    Each order is correlated against its own atlas window in m * lambda,
+    and the correlations are summed, so the zero point every order agrees
+    on wins. A single order carries too few lines to pick its own zero
+    point reliably. Orders with fewer than 5 detected lines are ignored.
+    The returned SNR is the peak of the summed correlation over its
+    robust scatter: tens means locked, single digits means the seed, the
+    order numbers or the atlas selection is wrong.
 
-    The reported SNR -- peak height over the robust scatter of the summed
-    correlation -- is the number to look at. Tens means locked. Single
-    digits means the seed, the order numbers, or the atlas selection is
-    wrong, and there is no point fitting anything until that is fixed.
+    Parameters
+    ----------
+    detections : list
+        One (n, 6) detection array or None per order.
+    order_numbers : list of int
+        Order number of each entry in detections.
+    reference : ReferenceLines
+        Atlas lines to correlate against.
+    seed : LinearSeed
+        Starting seed, giving the centre of the search.
+    n_pixels : int
+        Number of pixels along an order.
+    zero_point_range : float, optional
+        Half width of the zero-point search in m * lambda, in Angstrom.
+        Default 3000.0.
+    slope_fraction : float, optional
+        Fractional half range of the dispersion search around seed.B.
+        Default 0.06.
+    n_slope : int, optional
+        Number of dispersion values tried. Default 121.
+    grid_step : float, optional
+        Step of the correlation grid in m * lambda, in Angstrom.
+        Default 1.0.
+    expected_sigma_pixels : float, optional
+        Line sigma in pixels, setting the correlation kernel width.
+        Default 3.3.
+    verbose : bool, optional
+        Print the locked seed and its SNR. Default True.
 
-    Returns (LinearSeed, snr).
+    Returns
+    -------
+    seed : LinearSeed
+        The refined seed.
+    snr : float
+        Peak of the summed correlation over its robust scatter.
+
+    Raises
+    ------
+    ValueError
+        If no order has at least 5 detected lines.
     """
     y_hat = 2.0 * (np.arange(n_pixels) - (n_pixels - 1) / 2.0) / (n_pixels - 1)
 
@@ -742,29 +1135,46 @@ def lock_seed(detections, order_numbers, reference, seed, n_pixels,
               f"zero point moved {A - seed.A:+.0f} A, dispersion "
               f"{100 * (B / seed.B - 1):+.2f}%")
         print(f"  correlation SNR = {snr:.1f} over {len(live)} orders "
-              f"({'locked' if snr > 15 else 'WEAK -- do not trust this'})")
+              f"({'locked' if snr > 15 else 'WEAK, do not trust this'})")
     return LinearSeed(A, B, n_pixels), snr
 
 
 def check_order_number_offset(detections, order_numbers, reference, locked, n_pixels,
                               offsets=(-2, -1, 0, 1, 2), **lock_kwargs):
-    """Confirm the order numbers by brute force: re-lock with m shifted by a
-    constant and see which shift the atlas prefers.
+    """Confirm the order numbers by re-locking with m shifted by a constant.
 
-    Absolute order number is the one thing overlap agreement cannot check --
-    shift every m by one and a smooth surface will happily re-absorb it,
-    producing a self-consistent solution with every wavelength wrong by
-    roughly one free spectral range. Only the atlas can tell the difference,
-    and it does so emphatically: the correct offset should win by a wide
-    margin. If it does not, stop and fix the numbering.
+    Absolute order number is the one thing overlap agreement cannot
+    check: shifting every m by one gives a self-consistent solution with
+    every wavelength wrong by roughly one free spectral range. Only the
+    atlas separates them. The zero-point search is widened here, because
+    relabelling every order moves the best zero point by a whole order's
+    worth of m * lambda. Prints a warning if a non-zero offset locks
+    better, and treats a margin below 2.0 as no confirmation.
 
-    The zero-point search has to be wide here -- relabelling every order by
-    one moves the best zero point by a whole order's worth of m*lambda, so a
-    narrow window would never find the rival solution it is supposed to be
-    comparing against. Widening it also lets each offset find its own
-    aliases, which is the point: the true numbering is the only one where
-    all eighty-odd orders agree on a single zero point, and the aliases
-    cannot fake that.
+    Parameters
+    ----------
+    detections : list
+        One (n, 6) detection array or None per order.
+    order_numbers : list of int
+        Current order numbers.
+    reference : ReferenceLines
+        Atlas lines to correlate against.
+    locked : LinearSeed
+        Seed from lock_seed, used as the centre of each trial search.
+    n_pixels : int
+        Number of pixels along an order.
+    offsets : tuple of int, optional
+        Constant shifts in m to try. Default (-2, -1, 0, 1, 2).
+    **lock_kwargs
+        Override the lock_seed keywords used for each trial.
+
+    Returns
+    -------
+    results : dict
+        Lock SNR for each offset, keyed by the offset.
+    margin : float
+        SNR of the current numbering divided by that of the best rival
+        offset.
     """
     print("Order-number check (re-locking with m shifted by a constant):")
     median_m = float(np.median([m for m in order_numbers if m is not None]))
@@ -787,7 +1197,7 @@ def check_order_number_offset(detections, order_numbers, reference, locked, n_pi
               f"Every wavelength is out by about one free spectral range until this "
               f"is fixed, and no internal check will notice.")
     elif margin >= 2.0:
-        print(f"  current numbering wins by {margin:.1f}x -- "
+        print(f"  current numbering wins by {margin:.1f}x, "
               f"order numbers confirmed against the atlas.")
     else:
         print(f"  current numbering wins, but only by {margin:.1f}x. That is not a "
@@ -801,7 +1211,27 @@ def check_order_number_offset(detections, order_numbers, reference, locked, n_pi
 # ======================================================================
 
 class MatchSet:
-    """Detected lines paired with reference wavelengths, ready to fit."""
+    """Detected lines paired with reference wavelengths, ready to fit.
+
+    All arrays are parallel and have shape (n,).
+
+    Parameters
+    ----------
+    pixel : ndarray
+        Measured line centroids, in pixels.
+    m : ndarray
+        Order number of each line.
+    m_lambda : ndarray
+        Reference m * lambda of each line, in Angstrom.
+    weight : ndarray
+        Least-squares weight, 1 / sigma**2 in m * lambda.
+    pixel_err : ndarray
+        Centroid uncertainty of each line, in pixels.
+    snr : ndarray
+        Signal to noise of each detected line.
+    order_index : ndarray
+        Index into the orders list that each line came from.
+    """
 
     def __init__(self, pixel, m, m_lambda, weight, pixel_err, snr, order_index):
         self.pixel = pixel
@@ -813,9 +1243,22 @@ class MatchSet:
         self.order_index = order_index
 
     def __len__(self):
+        """Number of matched lines held."""
         return len(self.pixel)
 
     def subset(self, mask):
+        """Select a subset of the matches.
+
+        Parameters
+        ----------
+        mask : ndarray
+            Boolean mask or integer index array over the matches.
+
+        Returns
+        -------
+        matches : MatchSet
+            A new MatchSet holding the selected entries.
+        """
         return MatchSet(self.pixel[mask], self.m[mask], self.m_lambda[mask],
                         self.weight[mask], self.pixel_err[mask], self.snr[mask],
                         self.order_index[mask])
@@ -823,20 +1266,44 @@ class MatchSet:
 
 def match_lines(model, detections, order_numbers, reference, n_pixels,
                 tolerance_pixels, ambiguity_factor=2.5, max_pixel_error=1.0):
-    """Pair each detected line with a reference line, refusing anything
-    ambiguous.
+    """Pair each detected line with a reference line, refusing ambiguity.
 
     A match is kept only if the nearest reference line is within
-    `tolerance_pixels` AND the next-nearest is at least `ambiguity_factor`
-    times the tolerance further away. Where the atlas is dense this throws
-    away a lot of detections, which is the point: a match that could
-    plausibly have been its neighbour contributes a wrong wavelength as
-    readily as a right one, and no amount of sigma clipping downstream
-    reliably finds those again once they are in the fit.
-
-    The tolerance is specified in PIXELS and converted per order using the
-    current model's local dispersion, so one number means the same thing in
+    tolerance_pixels and the next-nearest is at least ambiguity_factor
+    times the tolerance further away. A match that could plausibly have
+    been its neighbour contributes a wrong wavelength as readily as a
+    right one, and sigma clipping downstream does not reliably find those
+    again. The tolerance is given in pixels and converted per order using
+    the model's local dispersion, so one number means the same thing in
     the blue and in the red.
+
+    Parameters
+    ----------
+    model : object
+        Any model exposing wavelength(pixel, m) and dispersion(pixel, m),
+        such as LinearSeed, PolynomialSurface or WavelengthSolution.
+    detections : list
+        One (n, 6) detection array or None per order.
+    order_numbers : list of int
+        Order number of each entry in detections.
+    reference : ReferenceLines
+        Atlas lines to match against.
+    n_pixels : int
+        Number of pixels along an order.
+    tolerance_pixels : float
+        Largest accepted separation between a detection and its reference
+        line, in pixels.
+    ambiguity_factor : float, optional
+        Required separation of the second-nearest reference line, in
+        units of the tolerance. Default 2.5.
+    max_pixel_error : float, optional
+        Detections with a larger centroid error, in pixels, are
+        discarded. Default 1.0.
+
+    Returns
+    -------
+    matches : MatchSet
+        The accepted matches, empty if nothing matched.
     """
     pix, ms, mlam, wgt, perr, snr, oidx = [], [], [], [], [], [], []
     ref_w = reference.wave
@@ -892,25 +1359,58 @@ FOCAL_LIMITS = (3000.0, 200000.0)   # plausible camera focal lengths, in pixels
 
 def fit_solution(matches, n_pixels, m_degree=2, correction_degree=None,
                  focal_guess=None, clip_sigma=4.0, max_iterations=6):
-    """Fit the physical surface (and its optional Chebyshev correction) to a
-    set of matched lines, with robust rejection.
+    """Fit the physical surface, and its correction, to matched lines.
 
-    Only the camera focal length is non-linear, so it is scanned on a grid
-    with an exact weighted least-squares solve inside -- no optimiser to get
-    stuck, no starting-value sensitivity.
+    The camera focal length is the only non-linear parameter. It is
+    scanned on a grid over FOCAL_LIMITS with an exact weighted
+    least-squares solve inside, then refined on a local grid, so there is
+    no optimiser to get stuck and no starting-value sensitivity. Clipping
+    and refitting repeat until the kept set stops changing.
 
-    Returns (solution, keep_mask, residuals_in_m_lambda).
+    Parameters
+    ----------
+    matches : MatchSet
+        Matched lines to fit.
+    n_pixels : int
+        Number of pixels along an order.
+    m_degree : int, optional
+        Degree of the polynomial in normalised order number. Default 2.
+    correction_degree : tuple of int, optional
+        Chebyshev degrees in (pixel, order number) for the correction
+        term. Default None, meaning no correction is fitted.
+    focal_guess : float, optional
+        Accepted but unused; the focal length is searched over the full
+        range on every iteration. Default None.
+    clip_sigma : float, optional
+        Residuals beyond this many robust sigma are rejected on the next
+        iteration. Default 4.0.
+    max_iterations : int, optional
+        Largest number of clip and refit iterations. Default 6.
+
+    Returns
+    -------
+    solution : WavelengthSolution
+        The fitted surface.
+    keep : ndarray
+        Boolean mask over matches of the surviving lines, shape
+        (len(matches),).
+    residuals : ndarray
+        Residual in m * lambda for every match, in Angstrom, shape
+        (len(matches),).
+
+    Raises
+    ------
+    ValueError
+        If fewer than 6 * (m_degree + 1) matched lines are supplied.
     """
     if len(matches) < 3 * (m_degree + 1) * 2:
-        raise ValueError(f"only {len(matches)} matched lines -- not enough to fit")
+        raise ValueError(f"only {len(matches)} matched lines, not enough to fit")
 
     m_min, m_max = matches.m.min(), matches.m.max()
-    # The focal length is the only non-linear parameter, and the only one
-    # that can run away: as f grows the basis flattens into a straight line
-    # and the Chebyshev correction can imitate whatever curvature was lost,
-    # so with poor matches the fit happily wanders off to f = infinity and
-    # throws away the very thing the physical basis was for. Bounded here,
-    # and searched on a grid rather than by an optimiser so it cannot creep.
+    # The focal length is the only non-linear parameter. As f grows the
+    # basis flattens towards a straight line and the correction term can
+    # imitate the lost curvature, so a fit to poor matches drifts to
+    # f = infinity. Bounded by FOCAL_LIMITS and searched on a grid.
     keep = np.ones(len(matches), bool)
     solution = None
     residuals = np.zeros(len(matches))
@@ -931,10 +1431,10 @@ def fit_solution(matches, n_pixels, m_degree=2, correction_degree=None,
         return best
 
     for _ in range(max_iterations):
-        # Full range every time, then a local refinement. Walking f in from
-        # wherever the previous pass left it is how it gets stranded at a
-        # bound: the early passes have bad matches and prefer no curvature,
-        # and a local search can never walk back from there.
+        # Full range every time, then a local refinement. Starting from
+        # where the previous pass left f strands it at a bound, because
+        # the early passes prefer no curvature and a local search cannot
+        # walk back from there.
         coarse = best_focal(np.geomspace(*FOCAL_LIMITS, 80))
         best = best_focal(np.clip(np.linspace(0.85 * coarse[1], 1.18 * coarse[1], 40),
                                   *FOCAL_LIMITS))
@@ -969,9 +1469,23 @@ def _rms_angstrom(matches, residuals, mask):
 
 
 def default_schedule(correction_degree=(4, 2)):
-    """The tightening ladder for the physical-model passes. Two uncorrected
-    passes first so the camera geometry is fitted to the lines alone, then
-    the correction comes in and the tolerance closes to two pixels."""
+    """Return the tightening ladder for the physical-model passes.
+
+    Two uncorrected passes come first, so the camera geometry is fitted
+    to the lines alone, then the correction is enabled and the matching
+    tolerance closes to 2.0 pixels.
+
+    Parameters
+    ----------
+    correction_degree : tuple of int, optional
+        Chebyshev degrees in (pixel, order number) used from the third
+        pass onward. Default (4, 2).
+
+    Returns
+    -------
+    schedule : list of tuple
+        (tolerance_pixels, correction_degree) for each of six passes.
+    """
     return [(4.0, None), (3.0, None),
             (2.5, correction_degree), (2.0, correction_degree),
             (2.0, correction_degree), (2.0, correction_degree)]
@@ -980,32 +1494,65 @@ def default_schedule(correction_degree=(4, 2)):
 def solve(orders, detections, reference, seed, n_pixels,
           schedule=None, warmup=None, m_degree=2, correction_degree=None,
           verbose=True):
-    """Go from a linear seed to the final solution.
+    """Go from a linear seed to the final wavelength solution.
 
-    The schedule alternates matching and fitting, starting loose and
-    tightening. Two details that matter more than they look:
+    Matching and fitting alternate, starting loose and tightening. The
+    model is refitted before the tolerance shrinks, never after, so each
+    tightening applies to a model that has already improved. The physical
+    basis takes over from the warm-up polynomial for the scheduled
+    passes; because it predicts the ends of each order correctly from the
+    middle, the lines there get matched on the following pass, and the
+    ends are where orders overlap.
 
-      * the model is refitted before the tolerance shrinks, never after, so
-        every tightening step is applied to a model that has already
-        improved;
-      * the physical basis is used from the second pass onward. That is what
-        lets matching reach the ends of each order. ThAr lines are matched
-        first wherever they are densest, and a polynomial fitted only there
-        misbehaves outside that range, so the ends never get matched and
-        never get fitted -- the failure feeds itself, and it shows up
-        precisely as neighbouring orders disagreeing where they overlap,
-        because overlaps live at the ends. A model made of the actual optics
-        predicts the ends correctly from the middle, so the lines there get
-        matched on the next pass.
+    Parameters
+    ----------
+    orders : list
+        Traced orders carrying order_number.
+    detections : list
+        One (n, 6) detection array or None per order.
+    reference : ReferenceLines
+        Atlas lines to match against.
+    seed : LinearSeed
+        Starting model for the first matching pass.
+    n_pixels : int
+        Number of pixels along an order.
+    schedule : list of tuple, optional
+        (tolerance_pixels, correction_degree) per physical-model pass.
+        Default None, meaning default_schedule().
+    warmup : list of tuple, optional
+        (tolerance_pixels, chebyshev_degrees) per warm-up pass. Default
+        None, meaning five passes tightening from 30.0 to 4.0 pixels
+        while the degree rises.
+    m_degree : int, optional
+        Degree of the polynomial in normalised order number. Default 2.
+    correction_degree : tuple of int, optional
+        Correction degrees used to build the default schedule. Default
+        None, meaning (4, 2).
+    verbose : bool, optional
+        Print one line per pass and the fitted focal length. Default
+        True.
 
-    Returns (solution, matches, keep_mask, residuals).
+    Returns
+    -------
+    solution : WavelengthSolution
+        The final surface.
+    matches : MatchSet
+        Matches from the final pass.
+    keep : ndarray
+        Boolean mask over matches of the surviving lines.
+    residuals : ndarray
+        Residual in m * lambda for every match, in Angstrom.
+
+    Raises
+    ------
+    RuntimeError
+        If a warm-up pass matches fewer than 60 lines.
     """
     if warmup is None:
-        # Tolerance comes down slowly and the degree goes up slowly. Cutting
-        # either corner strands the fit: too big a drop in tolerance throws
-        # away the lines at the ends of each order before the model is good
-        # enough to reach them, and too high a degree too early lets the
-        # polynomial chase the badly-matched ones.
+        # The tolerance comes down slowly and the degree rises slowly. Too
+        # large a drop in tolerance discards the lines at the ends of each
+        # order before the model can reach them; too high a degree too
+        # early lets the polynomial chase badly matched lines.
         warmup = [(30.0, (1, 0)), (15.0, (2, 1)), (8.0, (3, 1)),
                   (5.0, (4, 2)), (4.0, (4, 2))]
     if schedule is None:
@@ -1026,18 +1573,16 @@ def solve(orders, detections, reference, seed, n_pixels,
 
     # --- warm-up on a plain polynomial surface -------------------------
     # The physical basis must not be fitted to bad matches: its curvature
-    # is only pinned down by lines that are actually right, and given wrong
-    # ones it prefers a huge focal length (i.e. no curvature at all), which
-    # then has to be faked by the correction term and destroys exactly the
-    # extrapolation the basis was chosen for. So: get the matches honest
-    # first with something that cannot be led astray, then hand over.
+    # is pinned down only by correct lines, and wrong ones drive it to a
+    # huge focal length, which the correction term then has to fake. The
+    # warm-up surface makes the matches reliable before the hand-over.
     for step, (tolerance, degrees) in enumerate(warmup):
         matches = match_lines(model, detections, order_numbers, reference, n_pixels,
                               tolerance)
         if len(matches) < 60:
             raise RuntimeError(
                 f"only {len(matches)} lines matched at tolerance {tolerance} px. "
-                f"The seed is not close enough to the truth -- check the lock SNR, the "
+                f"The seed is not close enough to the truth. Check the lock SNR, the"
                 f"order numbers, and the clicked doublet before anything else.")
         solution, keep, residuals = fit_polynomial_surface(matches, n_pixels, degrees)
         model = solution
@@ -1063,7 +1608,7 @@ def solve(orders, detections, reference, seed, n_pixels,
         if FOCAL_LIMITS[0] * 1.02 < f < FOCAL_LIMITS[1] * 0.98:
             note = "inside the plausible range"
         else:
-            note = ("AT A BOUND -- the physical basis is not constraining anything "
+            note = ("AT A BOUND, so the physical basis is not constraining "
                     "here, so treat this as a plain polynomial fit and do not trust "
                     "it beyond the pixels that were matched")
         print(f"  camera focal length fitted at {f:.0f} px ({note})")
@@ -1075,11 +1620,17 @@ def solve(orders, detections, reference, seed, n_pixels,
 # ======================================================================
 
 class QualityReport:
-    """Everything measured about a solution, and whether it passes.
+    """The checks measured on a solution, and whether they all passed.
 
-    Kept as an object rather than printed and forgotten so the driver can
-    refuse to save a bad solution -- the failure mode worth designing
-    against is a plausible-looking wavelength axis that is quietly wrong.
+    Held as an object rather than printed, so that a driver can refuse to
+    save a solution that fails.
+
+    Attributes
+    ----------
+    checks : list of tuple
+        (name, passed, message) for every check added.
+    stats : dict
+        Measured quantities, keyed by name.
     """
 
     def __init__(self):
@@ -1087,13 +1638,26 @@ class QualityReport:
         self.stats = {}
 
     def add(self, name, passed, message):
+        """Record the outcome of one check.
+
+        Parameters
+        ----------
+        name : str
+            Short name of the check, printed in the report.
+        passed : bool
+            Whether the check passed.
+        message : str
+            One line stating the measured value and the threshold.
+        """
         self.checks.append((name, bool(passed), message))
 
     @property
     def passed(self):
+        """True if every recorded check passed."""
         return all(p for _, p, _ in self.checks)
 
     def show(self):
+        """Print every check and the overall verdict."""
         print("\n" + "=" * 72)
         print("WAVELENGTH SOLUTION QUALITY")
         print("=" * 72)
@@ -1106,14 +1670,37 @@ class QualityReport:
 
 def cross_validate(matches, keep, n_pixels, m_degree, correction_degree,
                    folds=5, seed=0):
-    """Hold out a fifth of the lines, fit on the rest, predict the held-out
-    ones -- repeated over all five folds.
+    """Measure the solution error on lines it was not fitted to.
 
-    The RMS of a fit against its own training lines always improves with
-    more free parameters, so it cannot tell you whether the extra freedom is
-    describing the instrument or the noise. This can. It is also the number
-    to quote: it is what the solution does to a line it has never seen,
-    which is what it will do to your science spectrum.
+    The kept matches are split into folds; each fold is predicted by a
+    solution fitted to the others. The RMS of a fit against its own
+    training lines always improves with more free parameters, so it
+    cannot show whether the extra freedom describes the instrument or the
+    noise, and this can. Predictions beyond 5 robust sigma are dropped,
+    since a fold can leave a gap that has to be extrapolated into.
+
+    Parameters
+    ----------
+    matches : MatchSet
+        All matched lines.
+    keep : ndarray
+        Boolean mask over matches selecting the lines to use.
+    n_pixels : int
+        Number of pixels along an order.
+    m_degree : int
+        Degree of the polynomial in normalised order number.
+    correction_degree : tuple of int or None
+        Chebyshev degrees for the correction term, or None for none.
+    folds : int, optional
+        Number of cross-validation folds. Default 5.
+    seed : int, optional
+        Seed of the shuffle that assigns lines to folds. Default 0.
+
+    Returns
+    -------
+    rms : float
+        Held-out RMS wavelength error in Angstrom, or NaN if every fold
+        failed to fit.
     """
     sub = matches.subset(keep)
     idx = np.arange(len(sub))
@@ -1140,13 +1727,46 @@ def cross_validate(matches, keep, n_pixels, m_degree, correction_degree,
 def choose_degrees(matches, keep, n_pixels,
                    m_degrees=(1, 2, 3), correction_degrees=(None, (2, 1), (3, 2), (4, 2), (5, 3)),
                    folds=5, tolerance=0.05, verbose=True):
-    """Pick the model complexity by cross-validation rather than by taste.
+    """Pick the model complexity by cross-validation.
 
-    Among models that cross-validate within `tolerance` of the best, the one
-    with the fewest free parameters wins. Extra degrees that buy nothing
-    measurable are not free: they are what lets a fit wander in the pixel
-    ranges where lines are sparse, which is exactly where you cannot see it
-    happening.
+    Every combination of m_degree and correction degree is
+    cross-validated. Among the models that cross-validate within
+    tolerance of the best, the one with the fewest free parameters wins.
+
+    Parameters
+    ----------
+    matches : MatchSet
+        All matched lines.
+    keep : ndarray
+        Boolean mask over matches selecting the lines to use.
+    n_pixels : int
+        Number of pixels along an order.
+    m_degrees : tuple of int, optional
+        Polynomial degrees in order number to try. Default (1, 2, 3).
+    correction_degrees : tuple, optional
+        Correction degrees to try, each a (pixel, order number) pair or
+        None. Default (None, (2, 1), (3, 2), (4, 2), (5, 3)).
+    folds : int, optional
+        Number of cross-validation folds. Default 5.
+    tolerance : float, optional
+        Fractional margin on the best cross-validated RMS within which a
+        simpler model is preferred. Default 0.05.
+    verbose : bool, optional
+        Print the result of every model tried. Default True.
+
+    Returns
+    -------
+    m_degree : int
+        Chosen polynomial degree in order number.
+    correction_degree : tuple of int or None
+        Chosen Chebyshev correction degrees.
+    cv : float
+        Cross-validated RMS of the chosen model, in Angstrom.
+
+    Raises
+    ------
+    RuntimeError
+        If cross-validation failed for every model tried.
     """
     if verbose:
         print(f"Choosing model complexity by {folds}-fold cross-validation:")
@@ -1181,23 +1801,48 @@ def overlap_agreement(orders, solution, spectrum_attr="thar_spectrum",
                       pixel_shift=0.0, velocity_ms=0.0,
                       min_overlap_angstrom=2.0, max_velocity_ms=20000.0,
                       oversample=5.0, min_contrast=3.0):
-    """Measure whether adjacent orders agree in wavelength space, using the
-    ThAr spectra themselves and no atlas at all.
+    """Measure whether adjacent orders agree, without using the atlas.
 
-    Where two orders overlap they observe the same lamp lines on different
-    parts of the detector. Put both on a common log-wavelength grid and
-    cross-correlate: the offset of the peak from zero is the disagreement,
-    in velocity, and it is completely independent of the line list.
+    Where two orders overlap they record the same lamp lines on different
+    parts of the detector. Both are put on a common log-wavelength grid
+    and cross-correlated, so the offset of the peak from zero is the
+    disagreement in velocity, independent of the line list. Orders whose
+    free spectral range is wider than the detector do not overlap and are
+    skipped, as are pairs whose correlation peak stands less than
+    min_contrast robust sigma above the median.
 
-    This is the check that answers "do the orders line up". A solution can
-    have a small residual against the atlas and still be wrong here if the
-    order-to-order behaviour is off. In practice a global surface makes this
-    nearly structural -- which is the argument for fitting one -- so a
-    failure means something more basic is broken.
+    Parameters
+    ----------
+    orders : list
+        Traced orders carrying order_number and the named spectrum.
+    solution : WavelengthSolution
+        Surface used to build each order's wavelength axis.
+    spectrum_attr : str, optional
+        Attribute holding the spectrum to correlate. Default
+        "thar_spectrum".
+    pixel_shift : float, optional
+        Shift subtracted from the pixel coordinate before the axis is
+        evaluated, in pixels. Default 0.0.
+    velocity_ms : float, optional
+        Velocity in m/s divided out of each axis. Default 0.0.
+    min_overlap_angstrom : float, optional
+        Least wavelength overlap worth correlating, in Angstrom.
+        Default 2.0.
+    max_velocity_ms : float, optional
+        Half width of the lag search, in m/s. Default 20000.0.
+    oversample : float, optional
+        Samples of the log-wavelength grid per detector pixel.
+        Default 5.0.
+    min_contrast : float, optional
+        Least height of the correlation peak above the median, in robust
+        sigma, for a pair to be reported. Default 3.0.
 
-    Returns (velocities, pairs) for the pairs that overlap. Orders red of
-    m ~ A / (2 * B) do not overlap at all -- their free spectral range is
-    wider than the detector -- and are silently skipped.
+    Returns
+    -------
+    velocities : ndarray
+        Disagreement of each usable pair, in m/s.
+    pairs : list of tuple
+        (order_number, order_number) for each entry in velocities.
     """
     velocities, pairs = [], []
     usable = [o for o in orders if o.order_number is not None
@@ -1222,10 +1867,9 @@ def overlap_agreement(orders, solution, spectrum_attr="thar_spectrum",
         if hi - lo < min_overlap_angstrom:
             continue
 
-        # Log-wavelength grid, so one lag is one constant velocity, sampled
-        # several times per detector pixel: quantising this at the pixel
-        # scale would report "they agree to within a pixel" and no more,
-        # which is far too blunt to be a check on anything.
+        # Log-wavelength grid, so one lag is one constant velocity,
+        # sampled several times per detector pixel. Quantising at the
+        # pixel scale would be too blunt to check anything.
         pixel_step = np.median(np.abs(np.diff(wa)))
         step = pixel_step / hi / oversample
         grid = np.arange(np.log(lo), np.log(hi), step)
@@ -1252,9 +1896,8 @@ def overlap_agreement(orders, solution, spectrum_attr="thar_spectrum",
         k = int(np.argmax(cc))
         if not (0 < k < len(cc) - 1):
             continue                      # peak is outside the search range
-        # a peak that does not stand out means these two orders share no
-        # lines worth correlating -- reporting a number for it is worse
-        # than reporting nothing
+        # a peak that does not stand out means the two orders share no
+        # lines worth correlating, so no number is reported for them
         scatter = 1.4826 * np.median(np.abs(cc - np.median(cc)))
         if scatter <= 0 or (cc[k] - np.median(cc)) / scatter < min_contrast:
             continue
@@ -1267,15 +1910,34 @@ def overlap_agreement(orders, solution, spectrum_attr="thar_spectrum",
 
 
 def residual_trends(matches, keep, residuals, n_pixels, n_bins=8):
-    """Bin the residuals against pixel and against order number.
+    """Bin the fit residuals against pixel and against order number.
 
-    A correct model leaves residuals with no structure. Systematic drift
-    with pixel means the dispersion shape is underfitted; drift with order
-    number means the cross-order term is. Both are things extra degrees can
-    fix, which is why this is reported next to the cross-validation rather
-    than instead of it.
+    A correct model leaves residuals with no structure. Drift with pixel
+    means the dispersion shape is underfitted; drift with order number
+    means the cross-order term is. Bins holding 5 lines or fewer are
+    omitted.
 
-    Returns (pixel_bins, order_bins), each a list of (label, n, mean_mA, rms_mA).
+    Parameters
+    ----------
+    matches : MatchSet
+        All matched lines.
+    keep : ndarray
+        Boolean mask over matches selecting the lines to bin.
+    residuals : ndarray
+        Residual in m * lambda for every match, in Angstrom, shape
+        (len(matches),).
+    n_pixels : int
+        Number of pixels along an order.
+    n_bins : int, optional
+        Number of bins along each axis. Default 8.
+
+    Returns
+    -------
+    pixel_bins : list of tuple
+        (label, n, mean, rms) per pixel bin, with mean and rms in
+        milli-Angstrom.
+    order_bins : list of tuple
+        (label, n, mean, rms) per order-number bin, same units.
     """
     r = residuals[keep] / matches.m[keep] * 1000.0
     p = matches.pixel[keep]
@@ -1305,13 +1967,65 @@ def assess(orders, solution, matches, keep, residuals, n_pixels, lock_snr,
            min_orders_with_lines=0.6, min_pixel_coverage=0.75,
            max_trend_ma=6.0, min_lock_snr=15.0, min_order_number_margin=2.0,
            verbose=True):
-    """Run every check and return a QualityReport.
+    """Run every quality check on a solution and return the report.
 
-    The thresholds are defaults, not laws -- set them from what this
-    instrument actually achieves. What matters is that they exist and that
-    the driver refuses to save a solution that fails them, so a bad night
-    announces itself instead of quietly producing a wavelength axis that
-    looks fine on a plot.
+    The checks cover the atlas lock, the order numbering, the fitted
+    residuals, cross-validation, order and pixel coverage, residual
+    trends, and adjacent-order overlap. The thresholds are defaults, not
+    laws; set them from what the instrument achieves.
+
+    Parameters
+    ----------
+    orders : list
+        Traced orders carrying order_number and thar_spectrum.
+    solution : WavelengthSolution
+        Surface to assess.
+    matches : MatchSet
+        Matches from the final fitting pass.
+    keep : ndarray
+        Boolean mask over matches of the surviving lines.
+    residuals : ndarray
+        Residual in m * lambda for every match, in Angstrom, shape
+        (len(matches),).
+    n_pixels : int
+        Number of pixels along an order.
+    lock_snr : float
+        Correlation SNR reported by lock_seed.
+    m_degree : int
+        Polynomial degree in order number used for the fit.
+    correction_degree : tuple of int or None
+        Chebyshev correction degrees used for the fit.
+    order_number_margin : float, optional
+        Margin from check_order_number_offset. Default None, meaning the
+        order-numbering check is skipped.
+    max_rms_ma : float, optional
+        Largest accepted fitted RMS, in milli-Angstrom. Default 15.0.
+    max_cv_ma : float, optional
+        Largest accepted cross-validated RMS, in milli-Angstrom.
+        Default 20.0.
+    max_overlap_ms : float, optional
+        Largest accepted median overlap disagreement, in m/s.
+        Default 600.0.
+    min_orders_with_lines : float, optional
+        Least fraction of numbered orders that must carry 4 or more
+        matched lines. Default 0.6.
+    min_pixel_coverage : float, optional
+        Least fraction of the detector that matched lines must span in
+        the median order. Default 0.75.
+    max_trend_ma : float, optional
+        Largest accepted binned mean residual, in milli-Angstrom.
+        Default 6.0.
+    min_lock_snr : float, optional
+        Least accepted lock SNR. Default 15.0.
+    min_order_number_margin : float, optional
+        Least accepted order-numbering margin. Default 2.0.
+    verbose : bool, optional
+        Print the report and the residual tables. Default True.
+
+    Returns
+    -------
+    report : QualityReport
+        The checks, their outcomes, and the measured statistics.
     """
     report = QualityReport()
     lam = matches.m_lambda[keep] / matches.m[keep]
@@ -1394,7 +2108,7 @@ def assess(orders, solution, matches, keep, residuals, n_pixels, lock_snr,
                    f"{worst:.0f} m/s worst (need <= {max_overlap_ms:.0f} m/s)")
     else:
         report.add("order overlap", False,
-                   "no adjacent orders overlap in wavelength -- cannot check")
+                   "no adjacent orders overlap in wavelength, cannot check")
 
     if verbose:
         report.show()
@@ -1417,10 +2131,10 @@ def assess(orders, solution, matches, keep, residuals, n_pixels, lock_snr,
         if thin:
             for m, (n, rms_o, cov) in thin:
                 print(f"    m={m:4d}  {n:3d} lines  rms {rms_o:6.2f} mA  covering {cov:4.0%} "
-                      f"of the order -- {solution.order_axis(m)[0]:.0f}-"
+                      f"of the order, {solution.order_axis(m)[0]:.0f}-"
                       f"{solution.order_axis(m)[-1]:.0f} A")
         else:
-            print("    none -- every order has 8+ lines spanning at least half of it")
+            print("    none, every order has 8+ lines spanning at least half of it")
         print("Highest per-order residuals:")
         for m, (n, rms_o, cov) in worst:
             print(f"    m={m:4d}  {n:3d} lines  rms {rms_o:6.2f} mA  covering {cov:4.0%}")
@@ -1430,53 +2144,53 @@ def assess(orders, solution, matches, keep, residuals, n_pixels, lock_snr,
             print(f"Orders with too few matched lines to check ({len(missing)}): "
                   f"{sorted(missing)}")
             print("    these still get a wavelength axis from the global surface, which is "
-                  "the point of fitting one -- but nothing in their own data confirms it")
+                  "the point of fitting one, but nothing in their own data confirms it")
     return report
 
 
 def measure_frame_shift(anchors, solution, verbose=True):
-    """Compare stellar lines of known wavelength against the solution, and
-    report the pixel shift between the frame they were measured in and the
-    ThAr frame the solution was built from.
+    """Measure the pixel shift between a frame and the arc frame.
 
-    This does double duty. It is an independent check -- lines in different
-    orders, from a different exposure, that never touched the fit -- and if
-    they all agree on one shift, the solution is right in a way no internal
-    residual can demonstrate. It is also the correction: a science exposure
-    taken hours from its arc has moved, and applying the arc's wavelength
-    axis to it unshifted puts every line in the wrong place by that amount.
+    Stellar lines of known wavelength are compared against the solution.
+    They take no part in the fit, so their agreement on a single shift is
+    an independent check as well as the correction itself. The result
+    does not say which of two things the offset is, and that decides how
+    it may be applied: flexure moves every order by the same number of
+    pixels, and evaluating the solution at pixel - shift undoes it
+    exactly, while a Doppler shift moves every order by the same fraction
+    of its wavelength. Correcting one as though it were the other leaves
+    adjacent orders disagreeing, worst in the red.
+    diagnose_frame_offset() tells the two apart.
 
-    anchors : list of (order_number, measured_pixel, rest_wavelength).
-        The clicked Na D pair is two of these; Halpha and Hbeta, if you
-        have their pixels, are two more in two other orders, which is what
-        makes the agreement meaningful.
+    Parameters
+    ----------
+    anchors : list of tuple
+        (order_number, measured_pixel, rest_wavelength) per line, with
+        the pixel in pixels and the wavelength in Angstrom. Anchors
+        outside their order's wavelength range are skipped with a
+        message.
+    solution : WavelengthSolution
+        Surface giving the predicted pixel of each rest wavelength.
+    verbose : bool, optional
+        Print the per-anchor table and any warning. Default True.
 
-    What it does NOT tell you is which of two very different things the
-    offset is, and that distinction decides how it may be applied:
-
-      * the spectrum has moved across the detector (flexure). Every order
-        moves by the same number of PIXELS, and evaluating the arc solution
-        at (pixel - shift) undoes it exactly.
-      * the light is Doppler shifted -- the target's radial velocity, the
-        Earth's motion, anything that scales with wavelength. Every order
-        moves by the same FRACTION of its wavelength, which is a different
-        number of pixels in each order and at each position along it.
-
-    Correcting one as though it were the other is not a small error. A
-    pixel shift applied to a Doppler offset leaves each order wrong by
-    shift x (its own dispersion), and dispersion goes as 1/m, so adjacent
-    orders end up disagreeing by roughly shift x d(lambda)/dy / m -- worst
-    in the red, shrinking towards the blue. Use diagnose_frame_offset() to
-    find out which one you have before applying anything.
-
-    Returns (shift_pixels, scatter_pixels, per-anchor list).
+    Returns
+    -------
+    shift : float
+        Median offset in pixels, or NaN if no anchor was usable.
+    scatter : float
+        Largest deviation of an anchor from the median, in pixels; 0.0
+        for a single anchor, NaN if no anchor was usable.
+    rows : list of tuple
+        (order_number, wavelength, measured_pixel, predicted_pixel,
+        shift_pixels, velocity_ms) per usable anchor.
     """
     rows = []
     for m, pixel, wave in anchors:
         axis = solution.order_axis(m)
         if not (axis.min() < wave < axis.max()):
             print(f"  {wave:.2f} A is outside order m={m} ({axis.min():.1f}-"
-                  f"{axis.max():.1f} A) -- skipping this anchor")
+                  f"{axis.max():.1f} A), so this anchor is skipped")
             continue
         predicted = float(np.interp(wave, axis, np.arange(len(axis)))
                           if axis[0] < axis[-1] else
@@ -1502,36 +2216,46 @@ def measure_frame_shift(anchors, solution, verbose=True):
               f"anchors agree to within {scatter:.2f} px")
         if scatter > 3.0:
             print("  WARNING: the anchors do NOT agree on one shift. That is not "
-                  "flexure -- suspect a misidentified line or a wrong order number.")
+                  "flexure, so suspect a misidentified line or a wrong order number.")
         elif abs(shift) > 5.0:
             print("  Do not apply this as a pixel shift until diagnose_frame_offset() "
-                  "says it is flexure -- see that function.")
+                  "says it is flexure. See that function.")
     return shift, scatter, rows
 
 
 def diagnose_frame_offset(orders, solution, shift_pixels, spectrum_attr="science_spectrum",
                           verbose=True):
-    """Decide whether an exposure's offset from the arc is a movement across
-    the detector or a Doppler shift, by asking the orders themselves.
+    """Decide whether a frame's offset is flexure or a Doppler shift.
 
-    The two are trivially separable if you look in the right place. Adjacent
-    orders see the same wavelengths where they overlap, so whichever
-    correction is right will leave them agreeing there and the wrong one
-    will pull them apart -- and the wrong one pulls them apart hard, because
-    a pixel is worth a different amount of wavelength in every order.
+    Adjacent orders see the same wavelengths where they overlap, so the
+    right correction leaves them agreeing there and the wrong one pulls
+    them apart. Under flexure the orders agree once the pixel shift is
+    applied and disagree without it; under a Doppler shift they agree
+    with no correction, and the pixel shift breaks that agreement. A
+    Doppler offset must not be removed with a pixel shift, and in general
+    should not be removed from the wavelength axis at all.
 
-      * flexure: the orders agree once the pixel shift is applied, and
-        disagree without it.
-      * Doppler: the orders agree WITHOUT any correction (a Doppler shift
-        moves every order by the same fraction, so they still line up), and
-        a pixel shift breaks that agreement.
+    Parameters
+    ----------
+    orders : list
+        Traced orders carrying order_number and the named spectrum.
+    solution : WavelengthSolution
+        Surface used to build each order's wavelength axis.
+    shift_pixels : float
+        Offset to test, in pixels, as measured by measure_frame_shift.
+    spectrum_attr : str, optional
+        Attribute holding the spectrum to correlate. Default
+        "science_spectrum".
+    verbose : bool, optional
+        Print both measurements and the verdict. Default True.
 
-    A Doppler offset must not be removed with a pixel shift, and in general
-    should not be removed from the wavelength axis at all: the arc solution
-    already gives observed wavelengths, and the target's velocity is
-    something to measure from the data, not to calibrate out of it.
-
-    Returns a dict of the two measurements plus a verdict string.
+    Returns
+    -------
+    result : dict
+        Keys "verdict", one of "flexure", "doppler" or "unknown", and
+        "uncorrected_ms" and "shifted_ms", the median overlap
+        disagreement in m/s without and with the pixel shift. Both
+        velocities are NaN when too few orders overlap.
     """
     uncorrected, _ = overlap_agreement(orders, solution, spectrum_attr=spectrum_attr)
     shifted, _ = overlap_agreement(orders, solution, spectrum_attr=spectrum_attr,
@@ -1566,11 +2290,31 @@ def diagnose_frame_offset(orders, solution, shift_pixels, spectrum_attr="science
 # ======================================================================
 
 def attach_solution(orders, solution, pixel_shift=0.0, velocity_ms=0.0, quiet=False):
-    """Give every order a callable pixel -> wavelength.
+    """Give every numbered order a callable pixel -> wavelength.
 
+    Sets wavelength_poly in place on each order that has an order number.
     Both corrections default to zero, which is the arc frame: observed
-    wavelengths, exactly as measured, and what gets saved as the master.
-    Only move away from it for a reason diagnose_frame_offset supports.
+    wavelengths exactly as measured, and what is saved as the master.
+    Move away from it only for a reason diagnose_frame_offset supports.
+
+    Parameters
+    ----------
+    orders : list
+        Traced orders. Each numbered order gains a wavelength_poly
+        attribute holding an OrderWavelength.
+    solution : WavelengthSolution
+        Surface to slice per order.
+    pixel_shift : float, optional
+        Shift applied to the pixel coordinate, in pixels. Default 0.0.
+    velocity_ms : float, optional
+        Velocity in m/s divided out of the axis. Default 0.0.
+    quiet : bool, optional
+        Suppress the summary line. Default False.
+
+    Returns
+    -------
+    None
+        The orders are modified in place.
     """
     n = 0
     for order in orders:
@@ -1590,8 +2334,25 @@ def attach_solution(orders, solution, pixel_shift=0.0, velocity_ms=0.0, quiet=Fa
 
 
 def store_matches(orders, matches, keep):
-    """Record which lines each order was calibrated with (for plots and for
-    the saved master solution)."""
+    """Record on each order the lines it was calibrated with.
+
+    Sets thar_pixels and thar_wavelengths in place on every numbered
+    order, for plots and for the saved master solution.
+
+    Parameters
+    ----------
+    orders : list
+        Traced orders carrying order_number.
+    matches : MatchSet
+        Matches from the final fitting pass.
+    keep : ndarray
+        Boolean mask over matches of the surviving lines.
+
+    Returns
+    -------
+    None
+        The orders are modified in place.
+    """
     for order in orders:
         if order.order_number is None:
             continue
@@ -1607,13 +2368,20 @@ def store_matches(orders, matches, keep):
 class OrderIdentifier:
     """Turns a position across the detector into a physical order number.
 
-    Order spacing varies smoothly across the detector (76 px between the
-    bluest orders here, 30 px between the reddest), so position -> order
-    number is a smooth monotonic curve. Fitting it does two things a lookup
-    table cannot: it tolerates the small cross-dispersion drift between
-    nights, and it extends past the orders the master itself traced, so a
-    later night that picks up an extra faint order at either end still gets
-    the right number for it.
+    Order spacing varies smoothly across the detector, so position to
+    order number is a smooth monotonic curve. Fitting it, rather than
+    tabulating it, tolerates the small cross-dispersion drift between
+    nights and extends past the orders the master itself traced.
+
+    Parameters
+    ----------
+    trace_x : ndarray
+        Cross-dispersion position of each traced order, in pixels.
+    order_number : ndarray
+        Order number of each traced order.
+    degree : int, optional
+        Polynomial degree, reduced to len(trace_x) - 2 where there are
+        too few orders for it. Default 4.
     """
 
     def __init__(self, trace_x, order_number, degree=4):
@@ -1628,40 +2396,72 @@ class OrderIdentifier:
         self.max_residual = float(np.max(np.abs(residual)))
 
     def __call__(self, x):
-        """Order number (not rounded) at cross-dispersion position x."""
+        """Order number at a cross-dispersion position, not rounded.
+
+        Parameters
+        ----------
+        x : ndarray or float
+            Cross-dispersion position, in pixels.
+
+        Returns
+        -------
+        m : ndarray or float
+            Fractional order number at x.
+        """
         return np.polyval(self.coefficients, np.asarray(x, float))
 
     def spacing_at(self, x):
-        """Local spacing between orders, in pixels, at position x."""
+        """Local spacing between adjacent orders, in pixels.
+
+        Parameters
+        ----------
+        x : ndarray or float
+            Cross-dispersion position, in pixels.
+
+        Returns
+        -------
+        spacing : ndarray or float
+            Pixels between adjacent orders at x, NaN where the fitted slope
+            is zero.
+        """
         slope = np.polyval(np.polyder(self.coefficients), np.asarray(x, float))
         return np.abs(1.0 / np.where(np.abs(slope) < 1e-12, np.nan, slope))
 
 
 def save_solution(path, solution, orders, report=None, white=None, atlas_path=None):
-    """Save a master solution.
+    """Write a master solution to a pickle file.
 
-    The thing that makes this reusable on a night whose traces are not the
-    same list is what identifies an order. Not its index -- a faint order
-    the tracer misses shifts every index after it, and nothing downstream
-    can tell. Not even its order number by itself, since that has to come
-    from somewhere. What is saved instead is where each order physically
-    sits across the detector, plus the white-light cross-section it was
-    measured from. An order's position is set by the optics, so on any
-    later night a trace found at that position IS that order, however many
-    orders were or were not traced around it.
+    Orders are identified by where they sit across the detector rather
+    than by index, because a faint order the tracer misses shifts every
+    later index. An order's position is set by the optics, so on a later
+    night a trace found at that position is that order. Stored: the
+    m * lambda surface; per order its number, spatial position, matched
+    lines and reference arc spectrum; and the spatial map, holding the
+    white-light profile, the row it came from, and an OrderIdentifier
+    that extrapolates to orders the master never traced.
 
-    Stored: the m*lambda surface; per order its number, spatial position,
-    matched lines and reference arc spectrum; and the spatial map (the
-    white-light profile, the row it came from, and the position -> order
-    number relation with the polynomial that lets it extrapolate to orders
-    the master itself never traced).
+    Parameters
+    ----------
+    path : str
+        Destination file path.
+    solution : WavelengthSolution
+        Surface to store.
+    orders : list
+        Traced orders; those with both an order number and a trace centre
+        are saved.
+    report : QualityReport, optional
+        Quality report to store alongside. Default None, meaning no
+        quality entry is written.
+    white : ndarray, optional
+        White-light image, shape (rows, columns); its middle row is
+        stored as the registration profile. Default None, meaning no
+        profile is stored.
+    atlas_path : str, optional
+        Path of the line list used, recorded for reuse. Default None.
 
-    A wavelength image, lambda(x, y), would be the other way to be
-    index-independent, and is worse on every count: sixty-odd megabytes
-    instead of a few hundred numbers, not smooth across order boundaries
-    so it cannot be interpolated or extended, and it would still have to be
-    registered against the new night's traces before it could be used. The
-    registration is the actual content, so store that.
+    Returns
+    -------
+    None
     """
     numbered = [o for o in orders if o.order_number is not None
                 and o.trace_center_pixel is not None]
@@ -1708,6 +2508,22 @@ def save_solution(path, solution, orders, report=None, white=None, atlas_path=No
 
 
 def load_solution(path):
+    """Read a master solution written by save_solution.
+
+    The pickle holds classes defined in this module, so this module must be
+    importable when it is called.
+
+    Parameters
+    ----------
+    path : str
+        Path to the .pkl file.
+
+    Returns
+    -------
+    saved : dict
+        Keys solution, spatial, atlas_path, orders and quality, as written
+        by save_solution.
+    """
     with open(path, "rb") as f:
         return pickle.load(f)
 
@@ -1717,8 +2533,29 @@ def load_solution(path):
 # ======================================================================
 
 def refine_line_at_guess(spectrum, guess, window=15, kind="absorption"):
-    """Snap an approximate pixel to the sub-pixel centroid of the nearest
-    line, by fitting a Gaussian in a window around it."""
+    """Snap an approximate pixel to the sub-pixel centroid of a line.
+
+    A Gaussian is fitted in a window around the guess. If the fit fails
+    or lands outside the window, the local extremum is returned and a
+    message is printed.
+
+    Parameters
+    ----------
+    spectrum : ndarray
+        Extracted spectrum of one order, shape (n_pixels,).
+    guess : float
+        Approximate line position, in pixels.
+    window : int, optional
+        Half width of the fitting window, in pixels. Default 15.
+    kind : str, optional
+        "absorption" to seek a minimum, anything else a maximum.
+        Default "absorption".
+
+    Returns
+    -------
+    pixel : float
+        Refined line centre, in pixels.
+    """
     s = np.asarray(spectrum, float)
     guess = int(round(guess))
     lo = max(0, guess - window)
@@ -1741,10 +2578,28 @@ def refine_line_at_guess(spectrum, guess, window=15, kind="absorption"):
 def click_line(spectrum, title, window=15, kind="absorption"):
     """Show a spectrum, take one click, return the refined line centre.
 
-    Clicking beats fitting for this: in a spectrum as line-rich as Arcturus
-    an automatic search has no way to know which deep line is the one you
-    meant, and the whole seed rests on getting that right. You only need to
-    land inside the window; the Gaussian does the rest.
+    A click is used rather than an automatic search because in a
+    line-rich spectrum only the operator knows which deep line is meant,
+    and the seed rests on that. The click need only land inside the
+    fitting window.
+
+    Parameters
+    ----------
+    spectrum : ndarray
+        Extracted spectrum of one order, shape (n_pixels,).
+    title : str
+        Plot title, also used in the printed messages.
+    window : int, optional
+        Half width of the fitting window, in pixels. Default 15.
+    kind : str, optional
+        "absorption" to seek a minimum, anything else a maximum.
+        Default "absorption".
+
+    Returns
+    -------
+    pixel : float or None
+        Refined line centre in pixels, or None if the window was closed
+        without a click.
     """
     spectrum = np.asarray(spectrum, float)
     fig = plt.figure(figsize=(13, 4))
@@ -1764,9 +2619,29 @@ def click_line(spectrum, title, window=15, kind="absorption"):
 
 def plot_calibrated_orders(orders, spectrum_attr="science_spectrum", title=None,
                            mark_lines=True):
-    """Every calibrated order on a common wavelength axis. Overlapping
-    orders should lie on top of each other; that is the eyeball version of
-    the overlap check."""
+    """Plot every calibrated order on a common wavelength axis.
+
+    Overlapping orders should lie on top of each other, which is the
+    visual form of the overlap check. Orders without a wavelength axis,
+    without the named spectrum, or with a non-positive peak are skipped.
+
+    Parameters
+    ----------
+    orders : list
+        Traced orders carrying wavelength_poly and the named spectrum.
+    spectrum_attr : str, optional
+        Attribute holding the spectrum to plot. Default
+        "science_spectrum".
+    title : str, optional
+        Figure title. Default None, meaning a title naming the number of
+        orders plotted.
+    mark_lines : bool, optional
+        Mark the ThAr lines each order was calibrated with. Default True.
+
+    Returns
+    -------
+    None
+    """
     plt.figure(figsize=(15, 6))
     n = 0
     for order in orders:

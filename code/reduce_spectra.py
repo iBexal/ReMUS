@@ -1,26 +1,13 @@
-"""
-reduce_spectra.py
+"""Apply a saved master wavelength solution to a new night of data.
 
-Reusing a master wavelength solution on any night's data.
+The master describes the instrument, so nothing here rebuilds it. Tonight's
+traces are identified against the master by their position on the detector,
+the arc nearest each science frame is registered against the master's own
+arc to give a shift along the dispersion, the shifted solution is checked
+against the atlas, and the science frames are extracted and written on the
+resulting wavelength axes.
 
-The master is a description of the instrument, not of the night it came
-from, so nothing here rebuilds it. What happens instead is:
-
-  1. tonight's traces are identified against the master by WHERE they sit on
-     the detector, never by counting down the trace list -- an order the
-     tracer misses, at either end or in the middle, costs that order and
-     nothing else;
-  2. the relevant arc is chosen by time and registered against the master's
-     own arc, giving a shift along the dispersion;
-  3. that shift is applied, and the result is checked against the atlas
-     rather than assumed to have worked;
-  4. the science frames are extracted and written out on the resulting
-     wavelength axes.
-
-Step 3 matters more than it looks. Registering one arc against another only
-shows the two look alike; a shift measured against a reference that was
-itself wrong reproduces the error exactly. Only the line list can say the
-wavelengths are right.
+Main entry points: reduce_science, load_master, remove_cosmic_rays.
 """
 
 import os
@@ -39,19 +26,34 @@ from order_tracing import trace_orders
 
 
 def align_trace_positions(new_x, saved_x, max_shift=120.0, step=0.25, sigma=2.0):
-    """Find the cross-dispersion shift that lines a new set of trace
-    positions up with the master's.
+    """Find the cross-dispersion shift between two sets of trace positions.
 
-    Done on the positions rather than on the white-light profile, because
-    the profile is close to a comb and a comb can lock a whole order out of
-    step -- which would misnumber every order by one, silently and
-    consistently. The positions cannot do that: order spacing runs from
-    about 76 px at the blue end to 30 px at the red, so an alignment that
-    is one order out fits at one end and is wildly wrong at the other. Only
-    the true shift lines all of them up at once, and it wins by a margin
-    that is worth reporting.
+    Matching is done on the positions rather than on the white-light
+    profile. Order spacing varies across the detector, so an alignment that
+    is one order out fits at one end and not at the other, and the contrast
+    reports how strongly the best shift beats such a rival.
 
-    Returns (shift, contrast).
+    Parameters
+    ----------
+    new_x : ndarray
+        Cross-dispersion positions of tonight's traces, in pixels.
+    saved_x : ndarray
+        Cross-dispersion positions of the master's traces, in pixels.
+    max_shift : float, optional
+        Largest shift searched, in pixels. Default 120.0.
+    step : float, optional
+        Spacing of the search grid, in pixels. Default 0.25.
+    sigma : float, optional
+        Width of the position-matching kernel, in pixels. Default 2.0.
+
+    Returns
+    -------
+    shift : float
+        Amount in pixels to subtract from a new position to land on the
+        master's. 0.0 if either set holds fewer than three positions.
+    contrast : float
+        Score of the best shift divided by that of the best rival at least
+        half an order away. 0.0 if no shift could be measured.
     """
     new_x = np.asarray(new_x, float)
     saved_x = np.asarray(saved_x, float)
@@ -78,10 +80,28 @@ def align_trace_positions(new_x, saved_x, max_shift=120.0, step=0.25, sigma=2.0)
 def measure_spatial_shift(new_profile, saved_profile, max_shift=80):
     """Cross-dispersion shift between two white-light cross-sections.
 
-    Everything moves together if the instrument has drifted sideways, so
-    this is measured once from the whole profile rather than order by
-    order, where each order would only be able to say which of its
-    neighbours it was nearest to.
+    Measured once from the whole profile, so a sideways drift of the
+    instrument is registered as a whole rather than order by order.
+
+    Parameters
+    ----------
+    new_profile : ndarray
+        Tonight's white-light cross-section, one value per pixel across
+        the dispersion.
+    saved_profile : ndarray
+        The master's white-light cross-section, same convention.
+    max_shift : int, optional
+        Largest lag searched, in pixels. Default 80.
+
+    Returns
+    -------
+    shift : float
+        Amount in pixels to subtract from a new position to land on the
+        master's, matching the sign of align_trace_positions. 0.0 if
+        either profile has no variation.
+    contrast : float
+        Height of the correlation peak above the median, in units of the
+        robust scatter of the correlation. 0.0 if no peak was measured.
     """
     a = np.asarray(saved_profile, float)
     b = np.asarray(new_profile, float)
@@ -110,31 +130,54 @@ def measure_spatial_shift(new_profile, saved_profile, max_shift=80):
 
 def assign_order_numbers_from_saved(orders, saved, white=None, max_spatial_shift=80,
                                     tolerance_fraction=0.35, verbose=True):
-    """Number tonight's traces from where they sit on the detector.
+    """Number tonight's traces from their position on the detector.
 
-    This is the step that makes a saved solution survive a different trace
-    list. Order numbers are never re-derived by counting from the start of
-    the list, so an order missed at the blue end -- or a new one picked up
-    there -- shifts nothing: each trace is identified by its own position,
-    independently of how many others were found.
+    A single cross-dispersion shift is measured first, then each trace
+    takes the order number of the saved position it lands on, provided it
+    lands within tolerance_fraction of the local order spacing. The
+    tolerance is a fraction because the spacing varies across the
+    detector. Traces beyond the range the master traced, but within two
+    order spacings of it, are numbered from the fitted
+    position-to-order-number curve instead; traces further out are left
+    unnumbered.
 
-    Two stages. A single cross-dispersion shift is measured first, from the
-    whole white-light profile if one was saved, so a night where the whole
-    spectrum has drifted sideways is registered as a whole rather than
-    order by order. Then each trace takes the order number of the saved
-    position it lands on, provided it lands within a fraction of the local
-    order spacing -- a fraction, not a fixed number of pixels, because the
-    spacing runs from about 76 px between the bluest orders to 30 px
-    between the reddest, and one tolerance cannot mean the same thing at
-    both ends. Traces outside the range the master covered are numbered
-    from the fitted position-to-order-number curve instead, and flagged.
+    Parameters
+    ----------
+    orders : list of Order
+        Tonight's traces. Modified in place: each order_number is set to
+        an int or to None.
+    saved : dict
+        Master solution as returned by load_master, including its
+        "spatial" map.
+    white : ndarray, optional
+        Coadded white-light frame, shape (n_rows, n_columns). Default
+        None, meaning the shift is not cross-checked against the saved
+        profile.
+    max_spatial_shift : int, optional
+        Largest cross-dispersion shift searched, in pixels. Default 80.
+    tolerance_fraction : float, optional
+        Fraction of the local order spacing within which a trace counts as
+        matching a saved position. Default 0.35.
+    verbose : bool, optional
+        Print the shift, the counts and any warnings. Default True.
 
-    Returns (n_matched, spatial_shift).
+    Returns
+    -------
+    n_numbered : int
+        Number of orders left holding an order number, matched and
+        extrapolated together.
+    shift : float
+        Cross-dispersion shift used, in pixels.
+
+    Raises
+    ------
+    ValueError
+        If the master carries no spatial map.
     """
     spatial = saved.get("spatial")
     if spatial is None:
         raise ValueError(
-            "this master has no spatial map -- it was written by an older version. "
+            "this master has no spatial map, so it was written by an older version. "
             "Rebuild it (BUILD_NEW_MASTER = True) so orders can be identified by "
             "position instead of by their index in the trace list.")
 
@@ -198,7 +241,7 @@ def assign_order_numbers_from_saved(orders, saved, white=None, max_spatial_shift
             order.order_number = None
             if verbose:
                 print(f"  trace at x={order.trace_center_pixel:.0f} is too far outside the "
-                      f"master's range to number -- leaving it out")
+                      f"master's range to number, so it is left out")
 
     numbered = [o for o in orders if o.order_number is not None]
     duplicates = len(numbered) - len(set(o.order_number for o in numbered))
@@ -214,12 +257,12 @@ def assign_order_numbers_from_saved(orders, saved, white=None, max_spatial_shift
                   f"m={min(o.order_number for o in numbered)} "
                   f"(the master had m={int(saved_m.max())} to {int(saved_m.min())})")
         if duplicates:
-            print(f"  WARNING: {duplicates} order number(s) assigned twice -- the traces "
+            print(f"  WARNING: {duplicates} order number(s) assigned twice, so the traces"
                   f"do not line up with the master's. Check the white-light frames.")
         if irregular:
             print(f"  note: {irregular} place(s) where consecutive traces are not "
                   f"consecutive orders. That is expected if the tracer missed a faint "
-                  f"order in the middle, and harmless -- the numbering does not depend "
+                  f"order in the middle, and harmless, since the numbering does not depend"
                   f"on counting.")
     return len(numbered), shift
 
@@ -252,18 +295,44 @@ def _cross_correlate_shift(reference, new, max_shift):
 
 def measure_arc_shift(orders, saved, max_shift_pixels=60.0, min_contrast=5.0,
                       verbose=True):
-    """Measure how far this arc has moved along the dispersion since the
-    master was built, by registering each order against its saved reference.
+    """Measure an arc's shift along the dispersion since the master.
 
-    One shift per order, then a robust median. The scatter between orders is
-    the part worth reading: a rigid shift is a statement that the whole
-    spectrum translated, and the orders disagreeing with each other is that
-    statement failing. A few tenths of a pixel is ordinary flexure. Pixels
-    of disagreement, or a trend with order number, means the dispersion
-    itself has changed and no single shift can express it.
+    Each order is cross-correlated against its saved reference arc, giving
+    one shift per order, and the result is their robust median. A scatter
+    of a few tenths of a pixel is ordinary flexure; a scatter of pixels, or
+    a trend with order number, means the dispersion itself has changed and
+    no single shift can express it.
 
-    Returns (shift, scatter, per-order dict, tilt) where tilt is the slope
-    of shift against order number, in pixels per order.
+    Parameters
+    ----------
+    orders : list of Order
+        Tonight's traces, numbered, with thar_spectrum extracted.
+    saved : dict
+        Master solution as returned by load_master.
+    max_shift_pixels : float, optional
+        Largest shift searched, in pixels. Default 60.0.
+    min_contrast : float, optional
+        Least correlation peak contrast for an order to be used. Default
+        5.0.
+    verbose : bool, optional
+        Print the shift, scatter, drift and any warning. Default True.
+
+    Returns
+    -------
+    shift : float
+        Median shift along the dispersion, in pixels.
+    scatter : float
+        Robust scatter of the per-order shifts, in pixels.
+    per_order : dict
+        Order number (int) to that order's own shift in pixels (float).
+    tilt : float
+        Slope of shift against order number, in pixels per order. 0.0 if
+        eight or fewer orders survive clipping.
+
+    Raises
+    ------
+    RuntimeError
+        If no order could be registered against the master.
     """
     by_number = {e["order_number"]: e for e in saved["orders"]}
     shifts, numbers = [], []
@@ -304,7 +373,7 @@ def measure_arc_shift(orders, saved, max_shift_pixels=60.0, min_contrast=5.0,
         if scatter > 1.0:
             print("  WARNING: the orders disagree by more than a pixel, so this is not a "
                   "rigid shift. Something has changed the dispersion, not just moved the "
-                  "spectrum -- rebuild the master rather than trusting a shift.")
+                  "spectrum. Rebuild the master rather than trusting a shift.")
     return shift, scatter, dict(zip(numbers.astype(int), shifts)), tilt
 
 
@@ -313,14 +382,45 @@ def verify_applied_solution(orders, solution, reference, pixel_shift, n_pixels,
                             detect_kwargs=None, verbose=True):
     """Check a reused solution against the arc it was just applied to.
 
-    Registering one arc against another says only that they look alike. It
-    cannot say the wavelengths are right, because a shift measured against
-    a reference that was itself wrong reproduces the error exactly. So the
-    applied solution is checked the same way it was built: match the new
-    arc's lines to the atlas and look at the residuals, and separately ask
-    whether adjacent orders still agree where they overlap.
+    Registering one arc against another shows only that the two look
+    alike; a shift measured against a reference that was itself wrong
+    reproduces the error. The shifted solution is therefore checked the
+    way it was built: the arc's detected lines are matched to the atlas
+    and their residuals measured, and adjacent orders are separately asked
+    whether they still agree where they overlap.
 
-    Returns a QualityReport.
+    Parameters
+    ----------
+    orders : list of Order
+        Tonight's traces, numbered, with thar_spectrum extracted.
+    solution : WavelengthSolution
+        The master's m*lambda surface, unshifted.
+    reference : ReferenceLines
+        Atlas lines usable at this instrument's resolution.
+    pixel_shift : float
+        Shift along the dispersion to apply to the solution, in pixels.
+    n_pixels : int
+        Length of one order, in pixels.
+    max_rms_ma : float, optional
+        Largest passing residual against the atlas, in milliAngstrom.
+        Default 15.0.
+    max_overlap_ms : float, optional
+        Largest passing median disagreement between overlapping orders, in
+        m/s. Default 600.0.
+    detect_kwargs : dict, optional
+        Extra keyword arguments for detect_all_orders. Default None,
+        meaning that function's own defaults.
+    verbose : bool, optional
+        Print the report. Default True.
+
+    Returns
+    -------
+    report : QualityReport
+        Holds the "atlas check" and "order overlap" checks, and the stats
+        "n_matched" (int), "rms_angstrom" (float, Angstrom) and
+        "overlap_ms" (ndarray, m/s). If fewer than 50 lines match the
+        atlas, the atlas check fails, the overlap check is not run, and
+        the stats keep their empty defaults.
     """
     report = QualityReport()
     report.stats.update({"n_matched": 0, "rms_angstrom": np.nan, "overlap_ms": np.array([])})
@@ -329,18 +429,29 @@ def verify_applied_solution(orders, solution, reference, pixel_shift, n_pixels,
                for o in orders if o.order_number is not None]
 
     class _Shifted:
-        """The saved surface as seen through the measured shift."""
+        """The master surface evaluated through a pixel shift.
+
+        Parameters
+        ----------
+        sol : WavelengthSolution
+            The master's m*lambda surface.
+        shift : float
+            Shift along the dispersion, in pixels.
+        """
         def __init__(self, sol, shift):
             self.sol, self.shift = sol, shift
             self.n_pixels = sol.n_pixels
 
         def wavelength(self, pixel, m):
+            """Wavelength in Angstrom, with the shift applied."""
             return self.sol.wavelength(np.asarray(pixel, float) - self.shift, m)
 
         def dispersion(self, pixel, m):
+            """Dispersion in Angstrom per pixel, with the shift applied."""
             return self.sol.dispersion(np.asarray(pixel, float) - self.shift, m)
 
         def order_axis(self, m, n=None):
+            """Full wavelength axis of one order, in Angstrom."""
             n = self.n_pixels if n is None else n
             return self.wavelength(np.arange(n), np.full(n, float(m)))
 
@@ -350,7 +461,7 @@ def verify_applied_solution(orders, solution, reference, pixel_shift, n_pixels,
 
     if len(matches) < 50:
         report.add("atlas check", False,
-                   f"only {len(matches)} lines matched -- the shifted solution does not "
+                   f"only {len(matches)} lines matched, so the shifted solution does not"
                    f"land on the atlas at all")
         if verbose:
             report.show()
@@ -389,12 +500,29 @@ def verify_applied_solution(orders, solution, reference, pixel_shift, n_pixels,
 # ======================================================================
 
 def load_master(path=None):
-    """Load the master solution and say what it is.
+    """Load the master solution and print a summary of it.
 
     The pickle holds classes defined in wavelength_solution.py, so that
-    module has to be importable when this runs -- which is why the pipeline
-    is run from the code directory. A master written before the spatial map
-    existed is refused rather than half-used.
+    module must be importable when this runs. A master carrying no spatial
+    map is refused rather than half used.
+
+    Parameters
+    ----------
+    path : str, optional
+        Path to the master pickle. Default None, meaning
+        config.MASTER_PATH.
+
+    Returns
+    -------
+    saved : dict
+        Keys "solution", "spatial", "orders", "atlas_path" and "quality".
+
+    Raises
+    ------
+    FileNotFoundError
+        If no file exists at the given path.
+    ValueError
+        If the master carries no spatial map.
     """
     path = path or config.MASTER_PATH
     if not os.path.exists(path):
@@ -404,7 +532,7 @@ def load_master(path=None):
     saved = ws.load_solution(path)
     if saved.get("spatial") is None:
         raise ValueError(
-            f"the master at {path} has no spatial map -- it predates order "
+            f"the master at {path} has no spatial map, so it predates order"
             f"identification by position. Rebuild it with make_master_thar.py.")
     solution = saved["solution"]
     quality = saved.get("quality") or {}
@@ -421,8 +549,24 @@ def load_master(path=None):
 
 
 def reference_lines_for_master(saved, n_pixels):
-    """The atlas lines usable at this instrument's resolution, taken from the
-    master's own surface rather than from a seed."""
+    """Select the atlas lines usable at this instrument's resolution.
+
+    The wavelength coverage and dispersion come from the master's own
+    surface rather than from a seed.
+
+    Parameters
+    ----------
+    saved : dict
+        Master solution as returned by load_master.
+    n_pixels : int
+        Length of one order, in pixels.
+
+    Returns
+    -------
+    reference : ReferenceLines
+        Atlas lines strong and isolated enough to calibrate against, with
+        wavelengths in Angstrom.
+    """
     solution = saved["solution"]
     m = float(np.median(saved["spatial"]["order_number"]))
     centre = float(solution.m_lambda(n_pixels // 2, m))
@@ -434,7 +578,20 @@ def reference_lines_for_master(saved, n_pixels):
 
 
 def extract_arc(orders, arc_path):
-    """Put an arc's spectra onto this night's traces."""
+    """Extract one arc frame along this night's traces.
+
+    Parameters
+    ----------
+    orders : list of Order
+        Tonight's traces. Modified in place: each thar_spectrum is set to
+        the extracted flux, shape (n_pixels,).
+    arc_path : str
+        Path to the arc FITS frame.
+
+    Returns
+    -------
+    None
+    """
     image = frames.read_image(arc_path)
     for order in orders:
         order.thar_spectrum = order.extract_thar(image,
@@ -445,7 +602,35 @@ def shift_for_arc(orders, saved, arc_path, reference=None, n_pixels=None,
                   verify=True):
     """Register one arc against the master and return its shift.
 
-    Returns (shift, scatter, report or None).
+    The arc is extracted onto the traces first, so each order's
+    thar_spectrum is replaced.
+
+    Parameters
+    ----------
+    orders : list of Order
+        Tonight's traces, numbered. Modified in place.
+    saved : dict
+        Master solution as returned by load_master.
+    arc_path : str
+        Path to the arc FITS frame.
+    reference : ReferenceLines, optional
+        Atlas lines for the verification step. Default None, meaning no
+        verification is done.
+    n_pixels : int, optional
+        Length of one order, in pixels. Default None, meaning the master
+        solution's own n_pixels.
+    verify : bool, optional
+        Check the shifted solution against the atlas. Default True.
+
+    Returns
+    -------
+    shift : float
+        Shift along the dispersion, in pixels.
+    scatter : float
+        Robust scatter of the per-order shifts, in pixels.
+    report : QualityReport or None
+        Result of verify_applied_solution, or None if no verification was
+        done.
     """
     print(f"\nRegistering {os.path.basename(arc_path)}:")
     extract_arc(orders, arc_path)
@@ -458,7 +643,7 @@ def shift_for_arc(orders, saved, arc_path, reference=None, n_pixels=None,
                                          **config.APPLY_QUALITY)
         if not report.passed:
             print("This arc does not reproduce the master. A shift cannot express a "
-                  "change in the dispersion itself -- if this persists, build a new "
+                  "change in the dispersion itself. If this persists, build a new"
                   "master from this night with make_master_thar.py.")
     return shift, scatter, report
 
@@ -470,22 +655,37 @@ def shift_for_arc(orders, saved, arc_path, reference=None, n_pixels=None,
 def remove_cosmic_rays(spectrum, max_width=2, threshold=8.0, neighbourhood=7):
     """Replace narrow positive spikes with the median of their neighbours.
 
-    Three tests, in order:
+    Three tests, in order: the reference level is the median of nearby
+    pixels with the candidate and everything within max_width of it
+    excluded, so a spike cannot prop up its own baseline; the excess over
+    that level must exceed threshold times the local noise; and flagged
+    pixels are grouped into runs, with every run longer than max_width put
+    back, so a real emission line survives untouched. Only positive spikes
+    are replaced; pixels reading low are left alone.
 
-      1. the reference is the median of nearby pixels with the candidate AND
-         everything within `max_width` of it excluded, so a two-pixel spike
-         cannot prop up its own baseline;
-      2. the excess must exceed `threshold` times the local noise;
-      3. flagged pixels are grouped into runs and any run longer than
-         `max_width` is put back -- a real emission line bright enough to
-         trip the threshold trips it right across its profile, forms a long
-         run, and survives untouched.
+    Parameters
+    ----------
+    spectrum : ndarray
+        One order's extracted flux, shape (n_pixels,).
+    max_width : int, optional
+        Longest run of flagged pixels that is replaced, in pixels. Runs
+        longer than this are put back. Default 2.
+    threshold : float, optional
+        Excess over the reference level required to flag a pixel, in units
+        of the local noise. Default 8.0.
+    neighbourhood : int, optional
+        Half-width of the window the reference level and local noise are
+        taken from, in pixels. Default 7.
 
-    Only positive spikes are touched. A pixel reading low is a detector
-    defect rather than a cosmic ray, and quietly filling those in would hide
-    a hardware problem worth knowing about.
-
-    Returns (cleaned spectrum, boolean mask of what was replaced).
+    Returns
+    -------
+    cleaned : ndarray
+        Copy of the input with flagged pixels set to the reference level,
+        shape (n_pixels,). The input array is not modified.
+    mask : ndarray of bool
+        True where a pixel was replaced, shape (n_pixels,). All False, and
+        cleaned an unchanged copy, if the spectrum is shorter than
+        2 * neighbourhood + 3 pixels or is not everywhere finite.
     """
     s = np.asarray(spectrum, float)
     n = len(s)
@@ -504,8 +704,8 @@ def remove_cosmic_rays(spectrum, max_width=2, threshold=8.0, neighbourhood=7):
     local = 1.4826 * np.median(np.abs(neighbours - reference[:, None]), axis=1)
 
     # Pixel-to-pixel noise for the whole order. Successive differences are
-    # blind to the smooth spectrum and only see the noise, and 4095 of them
-    # make a far steadier estimate than ten neighbours do.
+    # blind to the smooth spectrum and see only the noise, and there are
+    # far more of them than there are neighbours.
     order_noise = 1.4826 * np.median(np.abs(np.diff(s))) / np.sqrt(2.0)
     sigma = np.maximum(local, max(order_noise, 1e-9))
 
@@ -525,9 +725,25 @@ def remove_cosmic_rays(spectrum, max_width=2, threshold=8.0, neighbourhood=7):
 def clean_orders(orders, attr="science_spectrum", verbose=True, **kwargs):
     """Run the spike removal over every order of one frame.
 
-    Records the count on each order as `cosmic_rays_removed`, which is
-    written into the output file so you can see afterwards which orders were
-    touched and how hard.
+    Parameters
+    ----------
+    orders : list of Order
+        Tonight's traces. Modified in place: the named spectrum is
+        replaced by the cleaned one and cosmic_rays_removed is set to the
+        number of pixels replaced in that order, which save_reduced writes
+        into the output file.
+    attr : str, optional
+        Name of the attribute holding the spectrum to clean. Default
+        "science_spectrum".
+    verbose : bool, optional
+        Print the totals and the worst order. Default True.
+    **kwargs
+        Passed through to remove_cosmic_rays.
+
+    Returns
+    -------
+    total : int
+        Number of pixels replaced across all orders.
     """
     total, worst = 0, (0, None)
     for order in orders:
@@ -546,7 +762,7 @@ def clean_orders(orders, attr="science_spectrum", verbose=True, **kwargs):
               f"(worst m={worst[1]} with {worst[0]})")
         if worst[0] > 20:
             print(f"      m={worst[1]} is well above the rest. In a faint order that "
-                  f"usually means detector defects rather than cosmic rays -- compare "
+                  f"usually means detector defects rather than cosmic rays. Compare"
                   f"cosmic_rays_removed across several frames to tell them apart.")
     elif verbose:
         print("    narrow spikes: none found")
@@ -554,7 +770,25 @@ def clean_orders(orders, attr="science_spectrum", verbose=True, **kwargs):
 
 
 def _interpolated_shift(entries, when):
-    """Shift at `when`, from one or two (time, shift) measurements."""
+    """Shift at one time, from one or two (time, shift) measurements.
+
+    Parameters
+    ----------
+    entries : list of tuple
+        (datetime, shift in pixels) pairs in time order. Only the first
+        two are used.
+    when : datetime
+        Time the shift is wanted for, normally mid-exposure.
+
+    Returns
+    -------
+    shift : float
+        Shift along the dispersion, in pixels: the single measured value
+        for one entry, linearly interpolated for two, and their mean if
+        the two share a timestamp.
+    how : str
+        One-line description of how the shift was obtained.
+    """
     if len(entries) == 1:
         return entries[0][1], f"held at the value measured {entries[0][0]:%H:%M}"
     (t1, s1), (t2, s2) = entries[0], entries[1]
@@ -570,8 +804,29 @@ def _interpolated_shift(entries, when):
 def save_reduced(path, orders, science_path, arc_names, shift):
     """Write the wavelength-calibrated orders of one science frame.
 
-    Arrays are (n_orders, n_pixels), ordered blue to red by order number,
-    so wavelength[i] and flux[i] belong together.
+    Orders without an order number, a wavelength axis or a science
+    spectrum are left out. The wavelength (Angstrom) and flux arrays are
+    (n_orders, n_pixels), ordered blue to red by order number, so
+    wavelength[i] and flux[i] belong together.
+
+    Parameters
+    ----------
+    path : str
+        Destination path for the compressed .npz file.
+    orders : list of Order
+        Tonight's traces, extracted and carrying a wavelength axis.
+    science_path : str
+        Path of the science frame; its base name is stored as
+        "source_frame".
+    arc_names : list of str
+        Base names of the arcs used, stored as "arc_frames".
+    shift : float
+        Shift along the dispersion that was applied, in pixels, stored as
+        "pixel_shift".
+
+    Returns
+    -------
+    None
     """
     usable = [o for o in orders
               if o.order_number is not None and o.wavelength_poly is not None
@@ -596,22 +851,49 @@ def save_reduced(path, orders, science_path, arc_names, shift):
 def reduce_science(white_loc, arc_loc, science_files, out_dir=None,
                    master_path=None, arc_pattern="*ThAr*.fits", verify_arcs=True,
                    clean_cosmic_rays=None):
-    """Reduce a night: identify the orders, register the arcs, write spectra.
+    """Reduce a night: identify the orders, register the arcs, write files.
 
-    science_files : a list of paths, or a single path.
+    Each science frame takes the arc or arcs nearest it in time. Where it
+    is bracketed, the shift is interpolated to mid-exposure; where it is
+    not, the nearest arc's shift is used as measured. Each arc is
+    registered once however many frames use it, and every arc is verified,
+    not just the first. Science spectra have narrow positive spikes
+    replaced before they are written; the arcs are left alone.
 
-    Science spectra have narrow positive spikes replaced before they are
-    written -- see remove_cosmic_rays. The arcs are left alone: they are
-    seconds long rather than minutes, and the line detection already rejects
-    anything narrower than the instrumental profile, so a cosmic ray in an
-    arc cannot reach the fit anyway.
+    Parameters
+    ----------
+    white_loc : str
+        Directory of white-light flats to trace this night's orders from.
+    arc_loc : str
+        Directory of arc frames.
+    science_files : str or list of str
+        One science frame path, or a list of them.
+    out_dir : str, optional
+        Directory for the output files, created if absent. Default None,
+        meaning "unsorted" under config.REDUCED_ROOT.
+    master_path : str, optional
+        Path to the master pickle. Default None, meaning
+        config.MASTER_PATH.
+    arc_pattern : str, optional
+        Glob pattern selecting arc frames. Default "*ThAr*.fits".
+    verify_arcs : bool, optional
+        Check each arc's shifted solution against the atlas. Default True.
+    clean_cosmic_rays : bool, optional
+        Replace narrow spikes in the science spectra. Default None,
+        meaning config.CLEAN_COSMIC_RAYS.
 
-    Each science frame gets the arc or arcs nearest it in time. Where it is
-    bracketed, the shift is interpolated to the middle of the exposure;
-    where it is not, the nearest arc's shift is used as measured. Each arc
-    is registered once however many frames use it.
+    Returns
+    -------
+    written : list of tuple
+        One (science path, output path, shift in pixels) per frame
+        written.
 
-    Returns a list of (science path, output path, shift).
+    Raises
+    ------
+    FileNotFoundError
+        If no arc matches arc_pattern in arc_loc.
+    RuntimeError
+        If no trace could be matched to the master by position.
     """
     if isinstance(science_files, str):
         science_files = [science_files]
@@ -644,11 +926,10 @@ def reduce_science(white_loc, arc_loc, science_files, out_dir=None,
             max_gap_minutes=config.MAX_ARC_GAP_MINUTES)
         plans.append((path, chosen, when))
 
-    # Register each arc once, however many frames want it -- but check EVERY
-    # arc against the atlas, not just the first. Arcs from one night can be
-    # hours apart, and an instrument that has moved between them has moved
-    # between the science frames too. Checking one and assuming the rest is
-    # how a drifting night looks fine.
+    # Register each arc once, however many frames use it. Every arc is
+    # checked against the atlas, not just the first: arcs from one night
+    # can be hours apart, and an instrument that moved between them moved
+    # between the science frames too.
     measured = {}
     failed = []
     for _, chosen, _ in plans:

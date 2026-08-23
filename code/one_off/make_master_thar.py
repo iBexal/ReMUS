@@ -1,20 +1,16 @@
-"""
-one_off/make_master_thar.py
+"""Build a master wavelength solution. Run once per instrument configuration.
 
-Run this to build a master wavelength solution. Once per instrument
-configuration -- not once per night.
+Inputs: one night's white-light flats to trace the orders, one arc frame,
+and one science frame in which to click the Na D doublet. The result is
+written to config.MASTER_PATH, where every later reduction finds it, with a
+plain-text summary beside it and a dated copy in the archive folder.
 
-It needs one night's white-light flats to trace the orders, one arc, and one
-science frame to click the Na D doublet in. The result goes to
-config.MASTER_PATH, where every later reduction finds it, and is archived
-alongside so a good master is never lost to the next rebuild.
+config.py must already hold ANCHORS, NAD_TRACE and DIRECTION for the
+instrument. For a spectrograph the pipeline has not seen, get those from
+find_anchors.py in this folder first.
 
-Everything else -- every other night, every science frame -- goes through
-ReMUS.py, which only registers this result onto new data.
-
-Before this can run at all, config.py needs ANCHORS, NAD_TRACE and DIRECTION
-for the instrument. For a spectrograph the pipeline has not seen, get those
-from find_anchors.py in this folder first.
+Every other night and every science frame goes through ReMUS.py, which only
+registers this result onto new data.
 """
 
 import os
@@ -36,21 +32,21 @@ ARC_LOC = os.path.join(NIGHT, "Flat")
 SCIENCE_FILE = os.path.join(NIGHT, "Light", "Arcturus",
                             "Arcturus_Light_300_secs_2025-03-13T00-56-21_005.fits")
 
-# Which arc to build from. Any clean one will do -- this is the master's own
-# reference, and every later arc gets registered against it. None takes the
-# one nearest in time to SCIENCE_FILE.
+# Which arc to build from. Any clean one will do. It becomes the master's
+# reference, and every later arc is registered against it. None selects the
+# arc nearest in time to SCIENCE_FILE.
 ARC_FILE = None
 
 # ----------------------------------------------------------------------
 # The two clicks
 # ----------------------------------------------------------------------
 # Leave as None the first time and click the Na D doublet when the plots
-# open -- D2 (5889.95 A) first, then D1 (5895.92 A). The run prints a hint
-# to paste back here so you never click again on this data.
+# open: D2 (5889.95 A) first, then D1 (5895.92 A). The run prints the
+# refined pixels to paste back here so the clicking is only needed once.
 NAD_PIXEL_GUESSES = None            # this data: [2559.0, 2868.9]
 
-# Optional. These take no part in the fit; they check the finished solution
-# against lines in two further orders, and measure how far the science frame
+# Optional, and take no part in the fit. They check the finished solution
+# against lines in two further orders and measure how far the science frame
 # sits from the arc.
 HALPHA_PIXEL_GUESS = None           # this data: 2367.6, in trace config.ANCHORS[0]
 HBETA_PIXEL_GUESS = None            # this data: 1222.0, in trace config.ANCHORS[1]
