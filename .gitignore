@@ -8,3 +8,5 @@
 /code/_superseded/
 *.zip
 *.npz
+*.DS_Store
+*.json
