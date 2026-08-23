@@ -45,6 +45,44 @@ one function call each. All logic lives in the modules.
 
 ## Quick start
 
+### Reduce a night
+
+```
+python ReMUS.py
+```
+
+Set `NIGHT` and `TARGET` at the top. Nothing else is needed: the master is
+found where it always is, and arcs are matched to science frames by time.
+
+## How it works
+
+The model is fitted in `m * lambda`, the product of echelle order number and
+wavelength, because a single smooth function of detector row describes that
+product for every order at once:
+
+```
+m * lambda(y) = a0 + (a1 * u + a2 * f) / sqrt(f**2 + u**2),   u = y - y_centre
+```
+
+`f` is the camera focal length in pixels. A low-degree Chebyshev correction in
+(pixel, order number) is fitted on top. 
+
+Applying a master to a later night takes four steps, each of which reports
+itself:
+
+1. orders are identified by their position across the detector, never by
+   counting down the trace list, so an order the tracer misses costs that
+   order and nothing else;
+2. the arc nearest each science frame in time is registered against the
+   master's own arc, giving a shift along the dispersion;
+3. the shifted solution is matched against the ThAr atlas, which is the only
+   step that can show the master no longer fits this night;
+4. science spectra are extracted, cleaned of cosmic rays and written.
+
+ThAr line detection and atlas matching are redone from scratch for every arc.
+
+## Building wavelength solutions
+
 ### 1. Identify the anchor orders (first time on a spectrograph)
 
 ```
@@ -82,42 +120,6 @@ pixels to paste into `NAD_PIXEL_GUESSES` so the clicking is only needed once.
 The solution is written to `calibration/master_wavelength_solution.pkl` with a
 plain-text summary beside it and a dated copy in `calibration/archive/`. If
 any quality check fails it is reported and not saved.
-
-### 3. Reduce a night
-
-```
-python ReMUS.py
-```
-
-Set `NIGHT` and `TARGET` at the top. Nothing else is needed: the master is
-found where it always is, and arcs are matched to science frames by time.
-
-## How it works
-
-The model is fitted in `m * lambda`, the product of echelle order number and
-wavelength, because a single smooth function of detector row describes that
-product for every order at once:
-
-```
-m * lambda(y) = a0 + (a1 * u + a2 * f) / sqrt(f**2 + u**2),   u = y - y_centre
-```
-
-`f` is the camera focal length in pixels. A low-degree Chebyshev correction in
-(pixel, order number) is fitted on top. 
-
-Applying a master to a later night takes four steps, each of which reports
-itself:
-
-1. orders are identified by their position across the detector, never by
-   counting down the trace list, so an order the tracer misses costs that
-   order and nothing else;
-2. the arc nearest each science frame in time is registered against the
-   master's own arc, giving a shift along the dispersion;
-3. the shifted solution is matched against the ThAr atlas, which is the only
-   step that can show the master no longer fits this night;
-4. science spectra are extracted, cleaned of cosmic rays and written.
-
-ThAr line detection and atlas matching are redone from scratch for every arc.
 
 ## Configuration
 
