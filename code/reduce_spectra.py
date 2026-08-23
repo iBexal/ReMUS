@@ -463,6 +463,96 @@ def shift_for_arc(orders, saved, arc_path, reference=None, n_pixels=None,
     return shift, scatter, report
 
 
+# ======================================================================
+# cosmic rays
+# ======================================================================
+
+def remove_cosmic_rays(spectrum, max_width=2, threshold=8.0, neighbourhood=7):
+    """Replace narrow positive spikes with the median of their neighbours.
+
+    Three tests, in order:
+
+      1. the reference is the median of nearby pixels with the candidate AND
+         everything within `max_width` of it excluded, so a two-pixel spike
+         cannot prop up its own baseline;
+      2. the excess must exceed `threshold` times the local noise;
+      3. flagged pixels are grouped into runs and any run longer than
+         `max_width` is put back -- a real emission line bright enough to
+         trip the threshold trips it right across its profile, forms a long
+         run, and survives untouched.
+
+    Only positive spikes are touched. A pixel reading low is a detector
+    defect rather than a cosmic ray, and quietly filling those in would hide
+    a hardware problem worth knowing about.
+
+    Returns (cleaned spectrum, boolean mask of what was replaced).
+    """
+    s = np.asarray(spectrum, float)
+    n = len(s)
+    mask = np.zeros(n, bool)
+    if n < 2 * neighbourhood + 3 or not np.all(np.isfinite(s)):
+        return s.copy(), mask
+
+    # Neighbours: everything within `neighbourhood` except the candidate and
+    # the pixels close enough to belong to the same spike.
+    offsets = np.array([d for d in range(-neighbourhood, neighbourhood + 1)
+                        if abs(d) > max_width])
+    index = np.clip(np.arange(n)[:, None] + offsets[None, :], 0, n - 1)
+    neighbours = s[index]
+
+    reference = np.median(neighbours, axis=1)
+    local = 1.4826 * np.median(np.abs(neighbours - reference[:, None]), axis=1)
+
+    # Pixel-to-pixel noise for the whole order. Successive differences are
+    # blind to the smooth spectrum and only see the noise, and 4095 of them
+    # make a far steadier estimate than ten neighbours do.
+    order_noise = 1.4826 * np.median(np.abs(np.diff(s))) / np.sqrt(2.0)
+    sigma = np.maximum(local, max(order_noise, 1e-9))
+
+    candidate = (s - reference) > threshold * sigma
+    if candidate.any():
+        edges = np.flatnonzero(
+            np.diff(np.concatenate(([0], candidate.view(np.int8), [0]))))
+        for start, stop in zip(edges[::2], edges[1::2]):
+            if stop - start <= max_width:
+                mask[start:stop] = True
+
+    cleaned = s.copy()
+    cleaned[mask] = reference[mask]
+    return cleaned, mask
+
+
+def clean_orders(orders, attr="science_spectrum", verbose=True, **kwargs):
+    """Run the spike removal over every order of one frame.
+
+    Records the count on each order as `cosmic_rays_removed`, which is
+    written into the output file so you can see afterwards which orders were
+    touched and how hard.
+    """
+    total, worst = 0, (0, None)
+    for order in orders:
+        spectrum = getattr(order, attr, None)
+        if spectrum is None:
+            continue
+        cleaned, mask = remove_cosmic_rays(spectrum, **kwargs)
+        setattr(order, attr, cleaned)
+        order.cosmic_rays_removed = int(mask.sum())
+        total += order.cosmic_rays_removed
+        if order.cosmic_rays_removed > worst[0]:
+            worst = (order.cosmic_rays_removed, order.order_number)
+    if verbose and total:
+        n_orders = sum(1 for o in orders if getattr(o, "cosmic_rays_removed", 0))
+        print(f"    narrow spikes: {total} pixel(s) replaced across {n_orders} orders "
+              f"(worst m={worst[1]} with {worst[0]})")
+        if worst[0] > 20:
+            print(f"      m={worst[1]} is well above the rest. In a faint order that "
+                  f"usually means detector defects rather than cosmic rays -- compare "
+                  f"cosmic_rays_removed across several frames to tell them apart.")
+    elif verbose:
+        print("    narrow spikes: none found")
+    return total
+
+
 def _interpolated_shift(entries, when):
     """Shift at `when`, from one or two (time, shift) measurements."""
     if len(entries) == 1:
@@ -495,6 +585,8 @@ def save_reduced(path, orders, science_path, arc_names, shift):
         order_number=np.array([o.order_number for o in usable]),
         trace_x=np.array([o.trace_center_pixel for o in usable]),
         pixel=pixels,
+        cosmic_rays_removed=np.array([getattr(o, "cosmic_rays_removed", 0)
+                                      for o in usable]),
         source_frame=os.path.basename(science_path),
         arc_frames=np.array(arc_names),
         pixel_shift=shift)
@@ -502,10 +594,17 @@ def save_reduced(path, orders, science_path, arc_names, shift):
 
 
 def reduce_science(white_loc, arc_loc, science_files, out_dir=None,
-                   master_path=None, arc_pattern="*ThAr*.fits", verify_arcs=True):
+                   master_path=None, arc_pattern="*ThAr*.fits", verify_arcs=True,
+                   clean_cosmic_rays=None):
     """Reduce a night: identify the orders, register the arcs, write spectra.
 
     science_files : a list of paths, or a single path.
+
+    Science spectra have narrow positive spikes replaced before they are
+    written -- see remove_cosmic_rays. The arcs are left alone: they are
+    seconds long rather than minutes, and the line detection already rejects
+    anything narrower than the instrumental profile, so a cosmic ray in an
+    arc cannot reach the fit anyway.
 
     Each science frame gets the arc or arcs nearest it in time. Where it is
     bracketed, the shift is interpolated to the middle of the exposure;
@@ -516,6 +615,8 @@ def reduce_science(white_loc, arc_loc, science_files, out_dir=None,
     """
     if isinstance(science_files, str):
         science_files = [science_files]
+    clean = (config.CLEAN_COSMIC_RAYS if clean_cosmic_rays is None
+             else clean_cosmic_rays)
     saved = load_master(master_path)
     solution = saved["solution"]
 
@@ -583,6 +684,9 @@ def reduce_science(white_loc, arc_loc, science_files, out_dir=None,
                 continue
             order.science_spectrum = order.extract_weighted(
                 image, n_sigma=config.SCIENCE_EXTRACT_NSIGMA)
+        if clean:
+            clean_orders(orders, max_width=config.COSMIC_RAY_MAX_WIDTH,
+                         threshold=config.COSMIC_RAY_SIGMA)
         attach_solution(orders, solution, pixel_shift=shift, quiet=True)
 
         stem = os.path.splitext(os.path.basename(path))[0]
