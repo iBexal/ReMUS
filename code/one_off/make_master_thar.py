@@ -1,5 +1,5 @@
 """
-make_master_thar.py
+one_off/make_master_thar.py
 
 Run this to build a master wavelength solution. Once per instrument
 configuration -- not once per night.
@@ -11,13 +11,20 @@ alongside so a good master is never lost to the next rebuild.
 
 Everything else -- every other night, every science frame -- goes through
 ReMUS.py, which only registers this result onto new data.
+
+Before this can run at all, config.py needs ANCHORS, NAD_TRACE and DIRECTION
+for the instrument. For a spectrograph the pipeline has not seen, get those
+from find_anchors.py in this folder first.
 """
 
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 import frames
-from build_master_thar import build_master
+from one_off.build_master_thar import build_master
 
 # ----------------------------------------------------------------------
 # Which data to build from

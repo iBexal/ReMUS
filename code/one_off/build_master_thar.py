@@ -6,7 +6,7 @@ one arc, and one science frame.
 
 This is the expensive, interactive, once-per-instrument-configuration step.
 Run it from make_master_thar.py. Everything after it -- every other night,
-every science frame -- goes through apply_master_thar.py instead, which only
+every science frame -- goes through reduce_spectra.py instead, which only
 ever registers this result onto new data.
 
 The solution it produces is not tied to the night it was built from. It is a
