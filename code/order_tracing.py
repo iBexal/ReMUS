@@ -8,15 +8,14 @@ Main entry points: trace_orders, trace_single_order, choose_trace_window,
 find_spurious_peaks, and the Order class.
 """
 
-import glob
-import os
-
-import fitsio
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import map_coordinates
 from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
+
+import config
+import frames
 
 
 def gaussian(x, A, mu, sigma, c):
@@ -455,7 +454,8 @@ def choose_trace_window(peaks, window=8.0, verbose=True):
 def trace_orders(white_loc, diagnose=False, n_expected=None, auto_exclude=True,
                  exclude_rel_threshold=0.3, extra_exclude_indices=None,
                  prominence_fraction=0.005, min_separation=15,
-                 window=8.0, step=20, auto_window=True, trace_degree=3):
+                 window=8.0, step=20, auto_window=True, trace_degree=3,
+                 pattern=None):
     """Find and trace every order visible in a coadded white light flat.
 
     All FITS files in white_loc are median coadded, peaks are located in
@@ -466,7 +466,9 @@ def trace_orders(white_loc, diagnose=False, n_expected=None, auto_exclude=True,
     Parameters
     ----------
     white_loc : str
-        Directory searched for "*.fits" white light flat frames.
+        Directory searched for white light flat frames, matching pattern.
+        Frames are read through frames.read_image, so config.TRANSPOSE
+        applies.
     diagnose : bool, optional
         When True, plot the middle row profile with peak indices and any
         exclusions marked. Default False.
@@ -500,6 +502,9 @@ def trace_orders(white_loc, diagnose=False, n_expected=None, auto_exclude=True,
         Degree of the polynomials fitted to the measured trace centers and
         widths. Default 3. Raise it for strongly curved orders, having
         checked the residual with one_off/check_tracing.py.
+    pattern : str, optional
+        Filename glob selecting the flats. Default None, meaning
+        config.FRAME_PATTERN.
 
     Returns
     -------
@@ -513,16 +518,13 @@ def trace_orders(white_loc, diagnose=False, n_expected=None, auto_exclude=True,
     Raises
     ------
     FileNotFoundError
-        If white_loc contains no FITS files.
+        If white_loc contains no matching frames.
     """
-    white_files = glob.glob(os.path.join(white_loc, "*.fits"))
+    white_files = frames.list_frames(white_loc, pattern)
     if not white_files:
-        raise FileNotFoundError(f"no FITS files in {white_loc}")
-    frames = []
-    for path in white_files:
-        with fitsio.FITS(path) as f:
-            frames.append(f[0].read())
-    coadded = np.median(frames, axis=0)
+        raise FileNotFoundError(
+            f"no frames matching {pattern or config.FRAME_PATTERN} in {white_loc}")
+    coadded = np.median([frames.read_image(path) for path in white_files], axis=0)
 
     profile = coadded[coadded.shape[0] // 2, :]
     peaks, _ = find_peaks(profile, prominence=np.max(profile) * prominence_fraction,

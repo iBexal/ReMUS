@@ -40,6 +40,19 @@ REDUCED_ROOT = os.path.join(PROJECT_ROOT, "reduced")
 BLAZE_ANGLE_DEG = 64.35
 GROOVE_DENSITY_MM = 31.6
 
+# Detector orientation. The pipeline needs rows to be the dispersion
+# direction and columns the cross dispersion direction. Set True where the
+# raw frames come off the detector the other way round, and every frame is
+# transposed as it is read. HERCULES needs True, ReMUS needs False. Check
+# it with one_off/check_tracing.py: if the orders run across the image
+# rather than up it, this is wrong.
+TRANSPOSE = False
+
+# Filename patterns. Frames are not always called .fits: HERCULES writes
+# .fit, so "*.fit*" matches both.
+FRAME_PATTERN = "*.fits"
+ARC_PATTERN = "*ThAr*.fits"
+
 # m_i = m0 + DIRECTION * trace_index. -1 means trace index 0 is the bluest
 # (highest order number), which the anchors below imply and the white-light
 # brightness envelope confirms.

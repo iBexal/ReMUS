@@ -17,6 +17,8 @@ from datetime import datetime, timedelta
 import fitsio
 import numpy as np
 
+import config
+
 # Filenames carry a time as well, for example
 # ..._2025-03-12T22-57-07_008.fits, but it is not the same clock as the
 # header: on this data DATE-OBS is UTC and the filename is local, eleven
@@ -25,21 +27,34 @@ import numpy as np
 _FILENAME_TIME = re.compile(r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})")
 
 
-def read_image(path):
-    """Read the primary image of a FITS file.
+def read_image(path, transpose=None):
+    """Read the primary image of a FITS file, in the pipeline's orientation.
+
+    The pipeline needs rows to be the dispersion direction and columns the
+    cross dispersion direction. Detectors that read out the other way round
+    are transposed here, so every module downstream sees one orientation.
+    This is the only place a frame enters the pipeline, so it is the only
+    place the transpose has to happen.
 
     Parameters
     ----------
     path : str
         Path to the FITS file.
+    transpose : bool, optional
+        Transpose the frame as it is read. Default None, meaning
+        config.TRANSPOSE.
 
     Returns
     -------
     image : ndarray
-        Data of the primary HDU, 2D of shape (ny, nx) for detector frames.
+        Data of the primary HDU, 2D of shape (ny, nx), rows along
+        dispersion.
     """
+    if transpose is None:
+        transpose = config.TRANSPOSE
     with fitsio.FITS(path, "r") as f:
-        return f[0].read()
+        image = f[0].read()
+    return np.ascontiguousarray(image.T) if transpose else image
 
 
 def read_header(path):
@@ -79,12 +94,13 @@ def observation_time(path):
     exptime : float
         Exposure time in seconds, 0.0 if EXPTIME is missing or unreadable.
     source : str
-        "DATE-OBS", "filename", or "none" if no time was found.
+        "DATE-OBS", "DATE", "filename", or "none" if no time was found.
     """
     exptime = 0.0
     try:
         header = read_header(path)
-        raw = header.get("DATE-OBS")
+        # HERCULES writes DATE rather than DATE-OBS
+        raw = header.get("DATE-OBS") or header.get("DATE")
         try:
             exptime = float(header.get("EXPTIME") or 0.0)
         except (TypeError, ValueError):
@@ -93,7 +109,8 @@ def observation_time(path):
             text = str(raw).strip().strip("'").replace("Z", "")
             for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
                 try:
-                    return datetime.strptime(text, fmt), exptime, "DATE-OBS"
+                    return (datetime.strptime(text, fmt), exptime,
+                            "DATE-OBS" if header.get("DATE-OBS") else "DATE")
                 except ValueError:
                     continue
     except Exception:
@@ -125,7 +142,7 @@ def mid_exposure_time(path):
         Start time plus half the exposure time, None if no start time could
         be read.
     source : str
-        "DATE-OBS", "filename", or "none".
+        "DATE-OBS", "DATE", "filename", or "none".
     """
     start, exptime, source = observation_time(path)
     if start is None:
@@ -133,7 +150,7 @@ def mid_exposure_time(path):
     return start + timedelta(seconds=exptime / 2.0), source
 
 
-def list_frames(directory, pattern="*.fits", recursive=False):
+def list_frames(directory, pattern=None, recursive=False):
     """List the frames in a directory, sorted by path.
 
     Parameters
@@ -141,7 +158,7 @@ def list_frames(directory, pattern="*.fits", recursive=False):
     directory : str
         Directory to search.
     pattern : str, optional
-        Filename glob pattern. Default "*.fits".
+        Filename glob pattern. Default None, meaning config.FRAME_PATTERN.
     recursive : bool, optional
         When True, search subdirectories as well. Default False.
 
@@ -150,6 +167,7 @@ def list_frames(directory, pattern="*.fits", recursive=False):
     paths : list of str
         Matching file paths in sorted order, empty if nothing matches.
     """
+    pattern = pattern or config.FRAME_PATTERN
     if recursive:
         found = glob.glob(os.path.join(directory, "**", pattern), recursive=True)
     else:
@@ -157,7 +175,7 @@ def list_frames(directory, pattern="*.fits", recursive=False):
     return sorted(found)
 
 
-def list_arcs(directory, pattern="*ThAr*.fits", verbose=True):
+def list_arcs(directory, pattern=None, verbose=True):
     """List arc frames with their mid-exposure times, earliest first.
 
     Frames whose time cannot be read are dropped and reported, since an arc
@@ -170,7 +188,7 @@ def list_arcs(directory, pattern="*ThAr*.fits", verbose=True):
     directory : str
         Directory to search.
     pattern : str, optional
-        Filename glob pattern. Default "*ThAr*.fits".
+        Filename glob pattern. Default None, meaning config.ARC_PATTERN.
     verbose : bool, optional
         When True, print the number of arcs found, the span they cover in
         minutes, and the time sources used. Default True.
@@ -183,7 +201,7 @@ def list_arcs(directory, pattern="*ThAr*.fits", verbose=True):
     """
     arcs = []
     sources = set()
-    for path in list_frames(directory, pattern):
+    for path in list_frames(directory, pattern or config.ARC_PATTERN):
         when, source = mid_exposure_time(path)
         if when is None:
             print(f"  skipping {os.path.basename(path)}: no usable observation time")
