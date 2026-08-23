@@ -1,3 +1,21 @@
+# Raw and reduced data. Both are large and both are reproducible from the
+# raw frames, which are not kept here.
+spectra/
+reduced/
+
+# The master solution is a build product. The text summary beside it is
+# small and worth keeping, so it is not ignored.
+calibration/*.pkl
+calibration/archive/
+
+__pycache__/
+*.py[cod]
+.DS_Store
+.ipynb_checkpoints/
+.vscode/
+
+
+## Older stuff
 *.fit
 *.fits
 /files/
