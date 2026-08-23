@@ -15,7 +15,7 @@ import os
 
 import config
 import frames
-from apply_master_thar import reduce_science
+from reduce_spectra import reduce_science
 
 # ----------------------------------------------------------------------
 # Which night, which target

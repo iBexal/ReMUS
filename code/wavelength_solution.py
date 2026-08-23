@@ -2,7 +2,7 @@
 wavelength_solution.py
 
 The wavelength model, and everything that fits or judges one. Building a
-master lives in build_master_thar.py, reusing one in apply_master_thar.py;
+master lives in build_master_thar.py, reusing one in reduce_spectra.py;
 both are built out of what is here.
 
 Every class that ends up inside a saved master is defined in THIS module on
@@ -61,7 +61,7 @@ The pipeline:
     4. iterative solve        solve()                  -- match, fit, tighten
     5. quality gate           assess()                 -- CV + overlap + trends
     6. save                    save_solution()
-    7. reuse                   apply_master_thar.reduce_science()
+    7. reuse                   reduce_spectra.reduce_science()
 
 Nothing here touches order tracing or extraction; that is order_tracing.py.
 """
