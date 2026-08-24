@@ -74,11 +74,21 @@ NAD_LINES = [(5889.95, "Na D2"), (5895.92, "Na D1")]
 # line-detection width cuts and how isolated an atlas line has to be.
 EXPECTED_LINE_SIGMA_PIXELS = 3.3
 
+# Counts at or above which an arc line is discarded as saturated. A
+# saturated line is flat-topped and asymmetric and its centroid is
+# meaningless, so it is thrown away rather than fitted.
+#
+# In the same units as the frames the pipeline reads, which is raw ADU
+# with APPLY_BIAS off and ADU above bias with it on. On this detector the
+# pedestal is about 1000 ADU, so lower this by that much when bias
+# subtraction is on if you want the limit to mean the same thing.
+ARC_SATURATION = 55000.0
+
 # Reference lines must be strong, and must dominate their own resolution
 # element. The atlas carries about four lines per Angstrom in the blue
 # against a resolution element of a tenth of one.
-ATLAS_AMPLITUDE_MIN = 200.0
-ATLAS_DOMINANCE = 5.0
+ATLAS_AMPLITUDE_MIN = 150.0
+ATLAS_DOMINANCE = 4.0
 
 # ----------------------------------------------------------------------
 # Choosing an arc
@@ -91,7 +101,7 @@ ATLAS_DOMINANCE = 5.0
 # bracketing arcs are for. With arcs on one side only, the nearest is used
 # and its shift applied as measured.
 INTERPOLATE_BETWEEN_ARCS = True
-MAX_ARC_GAP_MINUTES = 90.0     # warn beyond this; flexure has had time to act
+MAX_ARC_GAP_MINUTES = 120.0     # warn beyond this; flexure has had time to act
 
 # ----------------------------------------------------------------------
 # Quality gates
@@ -120,6 +130,138 @@ APPLY_QUALITY = dict(
 # ----------------------------------------------------------------------
 SCIENCE_EXTRACT_NSIGMA = 3.0
 ARC_EXTRACT_NSIGMA = 2.5
+
+# ----------------------------------------------------------------------
+# Bias and dark
+# ----------------------------------------------------------------------
+# Applied in frames.read_image, so every frame that enters the pipeline
+# is corrected the same way and nothing downstream has to know. Both are
+# off by default: a wavelength solution is blind to an additive pedestal,
+# because line centroids are measured above a median-filtered continuum,
+# so leaving the bias in costs a wavelength axis nothing.
+#
+# Turn APPLY_BIAS on when flat fielding. A flat field divides, and
+# (S + bias) / (F + bias) is not S / F, so an un-debiased flat field is
+# wrong by an amount that depends on how bright the pixel is. On this
+# detector the pedestal is around 1000 ADU against flats peaking near
+# 49000, so the error is not subtle.
+#
+# APPLY_DARK matters much less here. Dark current measured from the 2026
+# masters is about 0.15 ADU/s at 0 C, so a 300 s exposure collects tens
+# of ADU. Worth having for long exposures and for hot pixels; not worth
+# scaling a 1 s dark up to 900 s to get, since that scales its read noise
+# with it.
+APPLY_BIAS = True
+APPLY_DARK = True
+FLAT_FIELD = True
+
+# A master FITS file, a directory to build one from, or a list of paths.
+# A directory is filtered on IMAGETYP where the frames carry one, so a
+# folder holding both a master bias and several master darks can be given
+# to both settings. Frames are grouped by exposure time and the group
+# nearest the frame being calibrated is used.
+MASTER_BIAS = os.path.join(SPECTRA_ROOT, "2026-ASTR3010", "Master_Bias_Darks_2026")
+MASTER_DARK = os.path.join(SPECTRA_ROOT, "2026-ASTR3010", "Master_Bias_Darks_2026")
+
+# True where the master dark still carries its own bias pedestal, which
+# is what a dark written straight off the camera looks like. The 2026
+# masters do: MasterDark_1s has a median of 1002 ADU against a bias of
+# 1004. With this set the bias is removed from the dark before the dark
+# current is scaled, so the pedestal is never subtracted twice or scaled.
+DARK_INCLUDES_BIAS = True
+
+# Scale the dark current by the ratio of exposure times. Dark current is
+# linear in time to well within its own noise over this range.
+SCALE_DARK_BY_EXPTIME = True
+DARK_EXPTIME_TOLERANCE = 4.0    # warn when the scale factor leaves 1/4 .. 4
+
+# How several calibration frames become one. "median" is safe; "mean" is
+# a 5-sigma-clipped mean, which has lower noise once there are more than
+# about ten frames.
+CALIBRATION_COMBINE = "median"
+
+# ----------------------------------------------------------------------
+# Flat fielding
+# ----------------------------------------------------------------------
+# The white lamp has its own steep continuum, so the flat is split into a
+# smooth part (the lamp's colour, the blaze, the fibre throughput) and a
+# pixel-to-pixel part, and only the second is divided out. See
+# flat_field.py. The lamp SED therefore never reaches the science
+# spectrum, and the blaze is left in the flux and saved alongside it so
+# it can be removed later if wanted.
+
+
+# Everything varying more slowly than this many pixels is called blaze
+# and kept out of the correction. It has to be much longer than a line
+# (about 8 px here) and much shorter than the blaze (thousands), so
+# anything from about 51 to 301 gives the same answer.
+FLAT_SMOOTH_WINDOW = 101
+
+# Leave the ends of an order alone, where the blaze has fallen away and
+# the measured response is mostly noise.
+FLAT_MIN_RELATIVE = 0.15
+
+# A response further from 1 than this is a defect, not a sensitivity.
+FLAT_MAX_CORRECTION = 1.5
+
+# Flat field the arcs as well as the science frames. A gradient in pixel
+# response across a line profile pulls its centroid, so this is the part
+# that touches the wavelength solution.
+FLAT_FIELD_ARCS = True
+
+# Counts at or above which the coadded flat is called saturated. Used
+# only to warn: a saturated flat flattens the order profile and both the
+# tracing and the flat field take that as real. Same units as
+# ARC_SATURATION, so it means ADU above bias once APPLY_BIAS is on.
+FLAT_SATURATION = 55000.0
+
+# ----------------------------------------------------------------------
+# Wavelength solution: how the fit is done
+# ----------------------------------------------------------------------
+# These change the numbers a rebuild produces. Each is separately
+# switchable so a master can be built both ways and the quality report
+# compared, and each defaults to the better behaviour.
+#
+# They cover the judgement calls only. Outright bug fixes are not
+# switchable and are applied always: a NaN sample no longer discards its
+# whole order in detect_arc_lines, an order with no order number no
+# longer raises in match_lines, and overlap_agreement no longer
+# interpolates on a reversed axis. Turning every switch here off gets
+# back the old fitting choices, not the old bugs.
+
+# Fit the line's local background as a slope rather than a constant, and
+# fit it to the raw spectrum instead of to the median-filter residual.
+# A 201 px running median through a line-dense ThAr spectrum tracks the
+# local line density, not the continuum, so what is left under a line is
+# a tilted pedestal. A tilt under a symmetric Gaussian moves its fitted
+# centre, and the amount varies with where the line sits in the blaze, so
+# it does not average out over many lines.
+ARC_LINE_LINEAR_BACKGROUND = True
+
+# Set the detection threshold from the noise near each line rather than
+# from one number for the whole order. Flux across an echelle order
+# varies by an order of magnitude, so a single threshold is too strict at
+# the ends of the order and too loose at the blaze peak. The ends are
+# where pixel coverage and order overlap are decided.
+ARC_LOCAL_NOISE = True
+
+# Clip on residuals divided by their own uncertainty rather than on
+# residuals in m*lambda. m runs 137 down to 52 here, so a fixed cut in
+# m*lambda is a factor of 2.6 tighter on the bluest order than the
+# reddest, and throws away good blue lines while keeping bad red ones.
+WEIGHTED_CLIPPING = True
+
+# Fit the physical surface and its Chebyshev correction together instead
+# of fitting the correction to the leftovers of the physical fit. Fitting
+# them in sequence is one step of backfitting, which does not reach the
+# least-squares optimum unless the two bases are orthogonal, and they are
+# not. It also lets the camera focal length be chosen against residuals
+# the correction has not yet absorbed.
+JOINT_CORRECTION_FIT = True
+
+# Apply the drift across the order range that measure_arc_shift already
+# measures, as a per-order shift, instead of only reporting it.
+APPLY_ARC_TILT = True
 
 # ----------------------------------------------------------------------
 # Cosmic rays
