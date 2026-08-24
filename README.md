@@ -1,7 +1,8 @@
 # ReMUS
 
 Reduction for the Macquarie University Spectrograph. Currently, ReMUS does
-order tracing, wavelength calibration, and an attempt at cosmic ray removal.
+order tracing, wavelength calibration, optional bias and dark subtraction,
+optional flat fielding, and an attempt at cosmic ray removal.
 
 ## Requirements
 
@@ -22,8 +23,9 @@ the import path and not about the file being damaged.
 ```
 code/
   config.py               instrument constants, paths, quality thresholds
-  frames.py               finding FITS frames, reading them, reading their times
+  frames.py               finding FITS frames, reading them, bias and dark, times
   order_tracing.py        finding orders on a flat and extracting along them
+  flat_field.py           splitting the white lamp into blaze and pixel response
   wavelength_solution.py  the wavelength model, fitting, quality checks, IO
   reduce_spectra.py       registering a master onto new data and writing spectra
   ReMUS.py                RUN: reduce one night
@@ -33,7 +35,7 @@ code/
     find_anchors.py       RUN: identify the anchor orders (once per spectrograph)
     make_master_thar.py   RUN: build a master (once per instrument configuration)
   thar_linelist/
-    ThAr_lines.dat        the ThAr line list
+    ThAr_lines.dat        the ThAr line list (VACUUM wavelengths)
 
 calibration/              the master solution, its summary, and the archive
 reduced/                  calibrated spectra, one .npz per science frame
@@ -134,7 +136,85 @@ Everything in `config.py`. The settings most likely to need changing:
 | `ATLAS_AMPLITUDE_MIN`, `ATLAS_DOMINANCE` | how strong and how isolated an atlas line must be |
 | `INTERPOLATE_BETWEEN_ARCS`, `MAX_ARC_GAP_MINUTES` | arc selection by time |
 | `CLEAN_COSMIC_RAYS`, `COSMIC_RAY_MAX_WIDTH`, `COSMIC_RAY_SIGMA` | spike removal |
+| `APPLY_BIAS`, `APPLY_DARK`, `MASTER_BIAS`, `MASTER_DARK` | detector calibration at read-in |
+| `FLAT_FIELD`, `FLAT_SMOOTH_WINDOW` | flat fielding from the white lamp |
 | `QUALITY`, `APPLY_QUALITY` | the pass/fail thresholds |
+
+## Bias, dark and flat
+
+All three are off by default, so nothing changes until they are turned on.
+They are separate switches because they buy different things.
+
+### Bias and dark
+
+Applied in `frames.read_image`, which is the one place a frame enters the
+pipeline, so everything downstream sees a corrected frame and none of it
+has to know.
+
+```
+APPLY_BIAS  = True
+APPLY_DARK  = True
+MASTER_BIAS = ".../Master_Bias_Darks_2026"
+MASTER_DARK = ".../Master_Bias_Darks_2026"
+```
+
+Either setting takes a master FITS file, a directory, or a list. A
+directory is filtered on `IMAGETYP`, so the same folder can be given to
+both. Frames are grouped by exposure time and the group nearest the frame
+being calibrated is used, then scaled by the ratio of exposure times; a
+scale far from 1 is reported, since stretching a 1 s dark to 900 s scales
+its read noise too. `DARK_INCLUDES_BIAS` says whether the master dark
+still carries its own pedestal, which the 2026 masters do, and stops the
+pedestal being subtracted twice.
+
+A wavelength axis does not need any of this. Line centroids are measured
+above a median-filtered continuum, which removes an additive pedestal
+along with everything else smooth. The reason to turn `APPLY_BIAS` on is
+flat fielding, below, because that divides.
+
+Dark current on this detector, measured from the 2026 masters, is about
+0.15 ADU/s at 0 C. A 300 s exposure collects tens of ADU against a bias
+of about 1000, so `APPLY_DARK` matters for long exposures and for hot
+pixels and not much else.
+
+### Flat fielding
+
+The white lamp is a quartz halogen bulb, so it has its own steep
+continuum, and dividing by a raw flat would print that continuum into
+every spectrum. It does not, because the flat is split first:
+
+```
+flat = blaze(pixel) * response(pixel)
+```
+
+`blaze` is everything varying more slowly than `FLAT_SMOOTH_WINDOW`
+pixels, measured with a running median: the lamp's colour, the grating's
+blaze and the fibre throughput, all together. `response` is what is left
+pixel to pixel, and averages to one. Only `response` is divided out, so
+the lamp's spectral signature never reaches the science spectrum. The
+separation is by spatial frequency alone and needs no model of the lamp.
+A line is about 8 pixels wide and the blaze runs over thousands, so any
+window between about 51 and 301 gives the same answer.
+
+The blaze is deliberately left in the flux, since removing it properly
+needs a flux standard, and saved in the output `.npz` as `blaze` so it
+can be divided out later.
+
+Two responses are measured from the same flat, one through the science
+extraction aperture and one through the narrower arc aperture, because a
+response measured through one does not exactly describe the other.
+`FLAT_FIELD_ARCS` controls whether the arcs are corrected; it is the part
+that touches the wavelength solution, since a gradient in pixel response
+across a line profile pulls its fitted centroid.
+
+Set `APPLY_BIAS` whenever `FLAT_FIELD` is on. A flat field divides and
+the pedestal is additive, so it does not cancel: `(S + b) / (F + b)` is
+not `S / F`. The pipeline warns if you forget.
+
+A master built with flat fielding on should be used with it on. The
+registration cross-correlates tonight's arc against the master's own, and
+correcting one side but not the other leaves a fixed mismatch between
+them.
 
 ## Output
 
@@ -152,7 +232,11 @@ together.
 | `cosmic_rays_removed` | (n_orders,) | pixels replaced per order |
 | `source_frame` | scalar | the science frame it came from |
 | `arc_frames` | (1 or 2,) | the arc or arcs that set the shift |
-| `pixel_shift` | scalar | shift applied, in pixels |
+| `pixel_shift` | scalar | shift applied at `pixel_shift_reference_m`, in pixels |
+| `pixel_shift_tilt` | scalar | change in that shift per order, pixels per order |
+| `pixel_shift_reference_m` | scalar | order number `pixel_shift` belongs to |
+| `blaze` | (n_orders, n_pixels) | smooth part of the white lamp; only when flat fielding |
+| `flat_fielded`, `bias_subtracted`, `dark_subtracted` | scalar | what was applied |
 
 ```python
 import numpy as np
@@ -180,7 +264,12 @@ Reuse adds two more: the shifted master must land on the atlas within 15 mA,
 and order overlap must still hold. The per-order scatter of the measured shift
 is printed as well; tenths of a pixel is ordinary flexure, pixels of
 disagreement means the dispersion itself changed and the master needs
-rebuilding.
+rebuilding. One pixel is about 1 km/s here, so the scatter reads directly as
+the disagreement a single rigid shift cannot express.
+
+Where the shift varies smoothly across the orders rather than randomly, that
+drift is fitted and applied per order rather than only reported. Set
+`APPLY_ARC_TILT = False` to go back to one rigid shift for every order.
 
 Order overlap is the only check with no atlas in it. Adjacent orders observe
 the same lamp lines on different parts of the detector, so cross-correlating
