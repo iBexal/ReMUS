@@ -17,6 +17,7 @@ import numpy as np
 from scipy.ndimage import median_filter
 
 import config
+import flat_field
 import frames
 import wavelength_solution as ws
 from wavelength_solution import (C_LIGHT_MS, OrderWavelength, QualityReport,
@@ -328,6 +329,9 @@ def measure_arc_shift(orders, saved, max_shift_pixels=60.0, min_contrast=5.0,
     tilt : float
         Slope of shift against order number, in pixels per order. 0.0 if
         eight or fewer orders survive clipping.
+    tilt_reference_m : float
+        Order number the returned shift belongs to, so the shift for any
+        order is shift + tilt * (m - tilt_reference_m).
 
     Raises
     ------
@@ -362,24 +366,43 @@ def measure_arc_shift(orders, saved, max_shift_pixels=60.0, min_contrast=5.0,
 
     keep = np.abs(shifts - shift) < max(4 * scatter, 0.5)
     tilt = 0.0
+    tilt_reference_m = float(np.median(numbers))
     if keep.sum() > 8:
-        tilt = float(np.polyfit(numbers[keep] - numbers[keep].mean(), shifts[keep], 1)[0])
+        tilt_reference_m = float(numbers[keep].mean())
+        slope, intercept = np.polyfit(numbers[keep] - tilt_reference_m,
+                                      shifts[keep], 1)
+        tilt = float(slope)
+        if getattr(config, "APPLY_ARC_TILT", True):
+            # A slope and an intercept have to come from the same line.
+            # Pairing the fitted slope with the median of every order
+            # would leave the two describing slightly different ones, so
+            # the intercept is used, but only when the slope will be. Left
+            # alone, the shift stays the robust median it has always been.
+            shift = float(intercept)
 
     if verbose:
         print(f"measure_arc_shift: {shift:+.2f} px along the dispersion, from "
               f"{len(shifts)} orders (scatter {scatter:.2f} px)")
-        print(f"  drift across the order range: {tilt * (numbers.max() - numbers.min()):+.2f} px "
-              f"end to end")
+        drift = tilt * (numbers.max() - numbers.min())
+        print(f"  drift across the order range: {drift:+.2f} px end to end"
+              + ("" if getattr(config, "APPLY_ARC_TILT", True)
+                 else " (reported only; APPLY_ARC_TILT is off)"))
         if scatter > 1.0:
             print("  WARNING: the orders disagree by more than a pixel, so this is not a "
                   "rigid shift. Something has changed the dispersion, not just moved the "
                   "spectrum. Rebuild the master rather than trusting a shift.")
-    return shift, scatter, dict(zip(numbers.astype(int), shifts)), tilt
+        elif scatter > 0.15:
+            print(f"  note: {scatter:.2f} px of scatter between orders is more than "
+                  f"flexure alone usually gives. At this dispersion that is around "
+                  f"{scatter * 1000:.0f} m/s of disagreement the single shift cannot "
+                  f"express.")
+    return shift, scatter, dict(zip(numbers.astype(int), shifts)), tilt, tilt_reference_m
 
 
 def verify_applied_solution(orders, solution, reference, pixel_shift, n_pixels,
                             max_rms_ma=15.0, max_overlap_ms=600.0,
-                            detect_kwargs=None, verbose=True):
+                            detect_kwargs=None, verbose=True,
+                            tilt=0.0, tilt_reference_m=0.0):
     """Check a reused solution against the arc it was just applied to.
 
     Registering one arc against another shows only that the two look
@@ -412,6 +435,14 @@ def verify_applied_solution(orders, solution, reference, pixel_shift, n_pixels,
         meaning that function's own defaults.
     verbose : bool, optional
         Print the report. Default True.
+    tilt : float, optional
+        Change in the shift per unit order number, in pixels per order.
+        Default 0.0, meaning one rigid shift. The check has to be made
+        against the same shift the spectra will be written on, or it
+        reports the accuracy of a solution nothing uses.
+    tilt_reference_m : float, optional
+        Order number pixel_shift belongs to. Default 0.0. Ignored when
+        tilt is 0.
 
     Returns
     -------
@@ -424,38 +455,58 @@ def verify_applied_solution(orders, solution, reference, pixel_shift, n_pixels,
     """
     report = QualityReport()
     report.stats.update({"n_matched": 0, "rms_angstrom": np.nan, "overlap_ms": np.array([])})
-    detections = detect_all_orders(orders, **(detect_kwargs or {}))
+    # The same detection settings the master was built with. Falling
+    # through to detect_arc_lines' own defaults meant that changing
+    # EXPECTED_LINE_SIGMA_PIXELS moved the atlas selection here while
+    # leaving the line detection where it was.
+    settings = dict(expected_sigma_pixels=config.EXPECTED_LINE_SIGMA_PIXELS,
+                    saturation=config.ARC_SATURATION)
+    settings.update(detect_kwargs or {})
+    detections = detect_all_orders(orders, **settings)
     shifted = [OrderWavelength(solution, o.order_number, pixel_shift=pixel_shift)
                for o in orders if o.order_number is not None]
 
     class _Shifted:
         """The master surface evaluated through a pixel shift.
 
+        The shift may vary linearly with order number, which is what
+        flexure that is not a rigid translation looks like.
+
         Parameters
         ----------
         sol : WavelengthSolution
             The master's m*lambda surface.
         shift : float
-            Shift along the dispersion, in pixels.
+            Shift along the dispersion at reference_m, in pixels.
+        tilt : float
+            Change in the shift per unit order number.
+        reference_m : float
+            Order number the shift belongs to.
         """
-        def __init__(self, sol, shift):
+        def __init__(self, sol, shift, tilt=0.0, reference_m=0.0):
             self.sol, self.shift = sol, shift
+            self.tilt, self.reference_m = tilt, reference_m
             self.n_pixels = sol.n_pixels
+
+        def _shift_at(self, m):
+            if not self.tilt:
+                return self.shift
+            return self.shift + self.tilt * (np.asarray(m, float) - self.reference_m)
 
         def wavelength(self, pixel, m):
             """Wavelength in Angstrom, with the shift applied."""
-            return self.sol.wavelength(np.asarray(pixel, float) - self.shift, m)
+            return self.sol.wavelength(np.asarray(pixel, float) - self._shift_at(m), m)
 
         def dispersion(self, pixel, m):
             """Dispersion in Angstrom per pixel, with the shift applied."""
-            return self.sol.dispersion(np.asarray(pixel, float) - self.shift, m)
+            return self.sol.dispersion(np.asarray(pixel, float) - self._shift_at(m), m)
 
         def order_axis(self, m, n=None):
             """Full wavelength axis of one order, in Angstrom."""
             n = self.n_pixels if n is None else n
             return self.wavelength(np.arange(n), np.full(n, float(m)))
 
-    model = _Shifted(solution, pixel_shift)
+    model = _Shifted(solution, pixel_shift, tilt, tilt_reference_m)
     matches = match_lines(model, detections, [o.order_number for o in orders],
                           reference, n_pixels, 2.0)
 
@@ -480,7 +531,8 @@ def verify_applied_solution(orders, solution, reference, pixel_shift, n_pixels,
                f"{keep.sum()} lines of this arc land on the atlas at {rms * 1000:.2f} mA "
                f"= {velocity:.0f} m/s (need <= {max_rms_ma:.0f} mA)")
 
-    velocities, pairs = overlap_agreement(orders, solution, pixel_shift=pixel_shift)
+    velocities, pairs = overlap_agreement(orders, solution, pixel_shift=pixel_shift,
+                                          tilt=tilt, tilt_reference_m=tilt_reference_m)
     if len(velocities):
         med = float(np.median(np.abs(velocities)))
         report.stats["overlap_ms"] = velocities
@@ -545,6 +597,37 @@ def load_master(path=None):
     if "rms_angstrom" in stats:
         print(f"  built to {stats['rms_angstrom'] * 1000:.2f} mA on "
               f"{stats.get('n_matched', '?')} lines")
+
+    # A master carries the reference arc spectra every later night is
+    # registered against, so those have to have been prepared the same
+    # way tonight's are. Older masters have no record of it and are left
+    # alone rather than guessed at.
+    processing = saved.get("processing")
+    if processing is None:
+        if config.FLAT_FIELD:
+            print("  note: this master predates the flat field and does not record "
+                  "how it was built. Its reference arcs are almost certainly not "
+                  "flat fielded, and tonight's will be. Rebuild it, or clear "
+                  "FLAT_FIELD.")
+    else:
+        now = {"flat_field": bool(config.FLAT_FIELD),
+               "flat_field_arcs": bool(config.FLAT_FIELD_ARCS),
+               "apply_bias": bool(config.APPLY_BIAS),
+               "apply_dark": bool(config.APPLY_DARK)}
+        differ = [k for k, v in now.items() if processing.get(k) != v]
+        # only the arc path can bias the registration; the rest are noted
+        arc_path_differs = [k for k in differ
+                            if k in ("flat_field", "flat_field_arcs", "apply_bias")]
+        if differ:
+            detail = ", ".join(f"{k}: master {processing.get(k)}, now {now[k]}"
+                               for k in differ)
+            print(f"  WARNING: this master was built with different settings "
+                  f"({detail}).")
+            if arc_path_differs:
+                print("    Registration cross-correlates tonight's arc against the "
+                      "master's own, so preparing one and not the other leaves a "
+                      "fixed mismatch in every measured shift. Match the settings "
+                      "or rebuild the master.")
     return saved
 
 
@@ -596,6 +679,10 @@ def extract_arc(orders, arc_path):
     for order in orders:
         order.thar_spectrum = order.extract_thar(image,
                                                  n_sigma=config.ARC_EXTRACT_NSIGMA)
+    if config.FLAT_FIELD and config.FLAT_FIELD_ARCS:
+        flat_field.apply_pixel_response(orders, "thar_spectrum",
+                                        response_attr="pixel_response_arc",
+                                        verbose=False)
 
 
 def shift_for_arc(orders, saved, arc_path, reference=None, n_pixels=None,
@@ -625,27 +712,35 @@ def shift_for_arc(orders, saved, arc_path, reference=None, n_pixels=None,
     Returns
     -------
     shift : float
-        Shift along the dispersion, in pixels.
+        Shift along the dispersion, in pixels, at tilt_reference_m.
     scatter : float
         Robust scatter of the per-order shifts, in pixels.
     report : QualityReport or None
         Result of verify_applied_solution, or None if no verification was
         done.
+    tilt : float
+        Change in the shift per unit order number, in pixels per order.
+        0.0 when config.APPLY_ARC_TILT is off, so the shift stays rigid.
+    tilt_reference_m : float
+        Order number the shift belongs to.
     """
     print(f"\nRegistering {os.path.basename(arc_path)}:")
     extract_arc(orders, arc_path)
-    shift, scatter, _, tilt = measure_arc_shift(orders, saved)
+    shift, scatter, _, tilt, tilt_reference_m = measure_arc_shift(orders, saved)
+    if not getattr(config, "APPLY_ARC_TILT", True):
+        tilt = 0.0
 
     report = None
     if verify and reference is not None:
         report = verify_applied_solution(orders, saved["solution"], reference, shift,
                                          n_pixels or saved["solution"].n_pixels,
+                                         tilt=tilt, tilt_reference_m=tilt_reference_m,
                                          **config.APPLY_QUALITY)
         if not report.passed:
             print("This arc does not reproduce the master. A shift cannot express a "
                   "change in the dispersion itself. If this persists, build a new"
                   "master from this night with make_master_thar.py.")
-    return shift, scatter, report
+    return shift, scatter, report, tilt, tilt_reference_m
 
 
 # ======================================================================
@@ -770,13 +865,14 @@ def clean_orders(orders, attr="science_spectrum", verbose=True, **kwargs):
 
 
 def _interpolated_shift(entries, when):
-    """Shift at one time, from one or two (time, shift) measurements.
+    """Shift at one time, from one or two (time, shift, tilt, m) measurements.
 
     Parameters
     ----------
     entries : list of tuple
-        (datetime, shift in pixels) pairs in time order. Only the first
-        two are used.
+        (datetime, shift in pixels, tilt in pixels per order, reference
+        order number) in time order. Only the first two are used; a third
+        arc is reported and ignored.
     when : datetime
         Time the shift is wanted for, normally mid-exposure.
 
@@ -786,22 +882,50 @@ def _interpolated_shift(entries, when):
         Shift along the dispersion, in pixels: the single measured value
         for one entry, linearly interpolated for two, and their mean if
         the two share a timestamp.
+    tilt : float
+        The tilt, interpolated the same way.
+    tilt_reference_m : float
+        Order number the shift belongs to.
     how : str
         One-line description of how the shift was obtained.
     """
+    if len(entries) > 2:
+        print(f"    note: {len(entries)} arcs are attached to this frame; only the "
+              f"first two bracket it and the rest are ignored.")
     if len(entries) == 1:
-        return entries[0][1], f"held at the value measured {entries[0][0]:%H:%M}"
-    (t1, s1), (t2, s2) = entries[0], entries[1]
+        t1, s1, k1, m1 = entries[0]
+        return s1, k1, m1, f"held at the value measured {t1:%H:%M}"
+    (t1, s1, k1, m1), (t2, s2, k2, m2) = entries[0], entries[1]
+    # Each arc measured its shift at its own reference order, so put both
+    # on a common one before they are mixed.
+    reference = 0.5 * (m1 + m2)
+    s1 = s1 + k1 * (reference - m1)
+    s2 = s2 + k2 * (reference - m2)
     span = (t2 - t1).total_seconds()
     if span <= 0:
-        return 0.5 * (s1 + s2), "averaged (the two arcs share a timestamp)"
+        return (0.5 * (s1 + s2), 0.5 * (k1 + k2), reference,
+                "averaged (the two arcs share a timestamp)")
+
     frac = (when - t1).total_seconds() / span
+    if not 0.0 <= frac <= 1.0:
+        # Both arcs on the same side of the exposure. Extrapolating a
+        # drift is guesswork, so the nearer measurement is held instead.
+        # s1 and s2 have already been moved onto the common reference
+        # order, so the held value has to come from those and not from
+        # the raw entry, which still belongs to its own reference.
+        t, s, k = (t1, s1, k1) if frac < 0 else (t2, s2, k2)
+        return s, k, reference, (f"held at the value measured {t:%H:%M} (both arcs "
+                                 f"fall on the same side of this exposure, so the "
+                                 f"drift is not extrapolated)")
     shift = s1 + frac * (s2 - s1)
-    return shift, (f"interpolated {frac:.0%} of the way from {t1:%H:%M} ({s1:+.2f} px) "
-                   f"to {t2:%H:%M} ({s2:+.2f} px)")
+    tilt = k1 + frac * (k2 - k1)
+    return shift, tilt, reference, (
+        f"interpolated {frac:.0%} of the way from {t1:%H:%M} ({s1:+.2f} px) "
+        f"to {t2:%H:%M} ({s2:+.2f} px)")
 
 
-def save_reduced(path, orders, science_path, arc_names, shift):
+def save_reduced(path, orders, science_path, arc_names, shift, tilt=0.0,
+                 tilt_reference_m=0.0):
     """Write the wavelength-calibrated orders of one science frame.
 
     Orders without an order number, a wavelength axis or a science
@@ -823,6 +947,12 @@ def save_reduced(path, orders, science_path, arc_names, shift):
     shift : float
         Shift along the dispersion that was applied, in pixels, stored as
         "pixel_shift".
+    tilt : float, optional
+        Change in that shift per unit order number, stored as
+        "pixel_shift_tilt". Default 0.0.
+    tilt_reference_m : float, optional
+        Order number the shift belongs to, stored as
+        "pixel_shift_reference_m". Default 0.0.
 
     Returns
     -------
@@ -833,8 +963,8 @@ def save_reduced(path, orders, science_path, arc_names, shift):
               and o.science_spectrum is not None]
     usable.sort(key=lambda o: -o.order_number)
     pixels = np.arange(len(usable[0].science_spectrum))
-    np.savez_compressed(
-        path,
+
+    arrays = dict(
         wavelength=np.array([o.wavelength_poly(pixels) for o in usable]),
         flux=np.array([o.science_spectrum for o in usable]),
         order_number=np.array([o.order_number for o in usable]),
@@ -844,7 +974,22 @@ def save_reduced(path, orders, science_path, arc_names, shift):
                                       for o in usable]),
         source_frame=os.path.basename(science_path),
         arc_frames=np.array(arc_names),
-        pixel_shift=shift)
+        pixel_shift=shift,
+        pixel_shift_tilt=tilt,
+        pixel_shift_reference_m=tilt_reference_m,
+        flat_fielded=bool(config.FLAT_FIELD),
+        bias_subtracted=bool(config.APPLY_BIAS),
+        dark_subtracted=bool(config.APPLY_DARK))
+
+    # The blaze is the smooth part of the white light spectrum: the
+    # lamp's own colour, the grating's blaze and the fibre throughput
+    # together. It is deliberately left in the flux rather than divided
+    # out, since removing it properly needs a flux standard, and saved
+    # here so it can be removed later by anyone who wants to.
+    if all(getattr(o, "blaze", None) is not None for o in usable) and usable:
+        arrays["blaze"] = np.array([o.blaze for o in usable])
+
+    np.savez_compressed(path, **arrays)
     print(f"    -> {os.path.basename(path)} ({len(usable)} orders)")
 
 
@@ -906,6 +1051,15 @@ def reduce_science(white_loc, arc_loc, science_files, out_dir=None,
     orders, white = trace_orders(white_loc)
     n_pixels = white.shape[0]
 
+    if config.FLAT_FIELD:
+        print()
+        if not config.APPLY_BIAS:
+            print("WARNING: FLAT_FIELD is on but APPLY_BIAS is off. A flat field "
+                  "divides, and the bias pedestal is additive, so it does not "
+                  "cancel: the response comes out diluted towards 1. Set "
+                  "APPLY_BIAS.")
+        flat_field.flat_field_orders(orders, white)
+
     print()
     n_identified, spatial_shift = assign_order_numbers_from_saved(orders, saved,
                                                                   white=white)
@@ -936,10 +1090,10 @@ def reduce_science(white_loc, arc_loc, science_files, out_dir=None,
         for arc_path, arc_time in chosen:
             if arc_path in measured:
                 continue
-            shift, scatter, report = shift_for_arc(
+            shift, scatter, report, tilt, tilt_m = shift_for_arc(
                 orders, saved, arc_path, reference=reference, n_pixels=n_pixels,
                 verify=verify_arcs)
-            measured[arc_path] = (arc_time, shift)
+            measured[arc_path] = (arc_time, shift, tilt, tilt_m)
             if report is not None and not report.passed:
                 failed.append(os.path.basename(arc_path))
 
@@ -955,8 +1109,8 @@ def reduce_science(white_loc, arc_loc, science_files, out_dir=None,
     print("\nExtracting and writing science frames:")
     written = []
     for path, chosen, when in plans:
-        entries = sorted((measured[a][0], measured[a][1]) for a, _ in chosen)
-        shift, how = _interpolated_shift(entries, when or entries[0][0])
+        entries = sorted(measured[a] for a, _ in chosen)
+        shift, tilt, tilt_m, how = _interpolated_shift(entries, when or entries[0][0])
         print(f"  {os.path.basename(path)}: shift {shift:+.2f} px, {how}")
 
         image = frames.read_image(path)
@@ -965,15 +1119,19 @@ def reduce_science(white_loc, arc_loc, science_files, out_dir=None,
                 continue
             order.science_spectrum = order.extract_weighted(
                 image, n_sigma=config.SCIENCE_EXTRACT_NSIGMA)
+        if config.FLAT_FIELD:
+            flat_field.apply_pixel_response(orders, "science_spectrum",
+                                            verbose=False)
         if clean:
             clean_orders(orders, max_width=config.COSMIC_RAY_MAX_WIDTH,
                          threshold=config.COSMIC_RAY_SIGMA)
-        attach_solution(orders, solution, pixel_shift=shift, quiet=True)
+        attach_solution(orders, solution, pixel_shift=shift, quiet=True,
+                        tilt=tilt, tilt_reference_m=tilt_m)
 
         stem = os.path.splitext(os.path.basename(path))[0]
         out_path = os.path.join(out_dir, stem + "_wave.npz")
         save_reduced(out_path, orders, path, [os.path.basename(a) for a, _ in chosen],
-                     shift)
+                     shift, tilt=tilt, tilt_reference_m=tilt_m)
         written.append((path, out_path, shift))
 
     print(f"\nDone: {len(written)} frame(s) written to {out_dir}")
