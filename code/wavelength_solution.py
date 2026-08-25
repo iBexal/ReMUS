@@ -31,6 +31,16 @@ from scipy.ndimage import median_filter
 from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
 
+# The fitting switches live in config, but this module is also what a
+# saved master unpickles into, and that has to work wherever the pickle
+# is opened. So config is optional here and every use of it goes through
+# getattr with the default written out, which is what getattr(None, ...)
+# falls back to.
+try:
+    import config
+except ImportError:                      # pragma: no cover - import path only
+    config = None
+
 C_LIGHT_MS = 299792458.0
 
 
@@ -196,7 +206,8 @@ class ReferenceLines:
 
 
 def load_atlas(path, ion_prefix="Th", amplitude_min=10.0):
-    """Read a ThAr line list in the '|'-delimited NIST/Murphy format.
+    """Read a ThAr line list in the '|'-delimited. The lines
+    are in VACUUM wavelengths (from pypeit).
 
     Ar lines are dropped by default; they blend and shift more readily
     than Th lines. The complete list is returned as well, because the
@@ -303,6 +314,37 @@ def _gaussian(x, amp, mu, sigma, offset):
     return amp * np.exp(-(x - mu) ** 2 / (2.0 * sigma ** 2)) + offset
 
 
+def _gaussian_sloped(x, amp, mu, sigma, offset, slope):
+    """A Gaussian on a straight line rather than on a constant.
+
+    The line is written about mu so that offset stays the background
+    level under the line itself and the two are close to uncorrelated,
+    which keeps the fit well conditioned.
+
+    Parameters
+    ----------
+    x : ndarray
+        Positions at which to evaluate, in pixels.
+    amp : float
+        Peak amplitude above the background, in counts.
+    mu : float
+        Centre of the Gaussian, in pixels.
+    sigma : float
+        Standard deviation of the Gaussian, in pixels.
+    offset : float
+        Background level at mu, in counts.
+    slope : float
+        Gradient of the background, in counts per pixel.
+
+    Returns
+    -------
+    values : ndarray
+        Profile values, same shape as x.
+    """
+    return (amp * np.exp(-(x - mu) ** 2 / (2.0 * sigma ** 2))
+            + offset + slope * (x - mu))
+
+
 # columns of the detection array
 DET_PIXEL, DET_SIGMA, DET_AMP, DET_SNR, DET_PIXERR, DET_FITRES = range(6)
 
@@ -396,8 +438,21 @@ def detect_arc_lines(spectrum, expected_sigma_pixels=3.3, detection_sigma=7.0,
         no line survives. None if the spectrum has non-finite values.
     """
     s = np.asarray(spectrum, float)
-    if not np.all(np.isfinite(s)):
+
+    # A single non-finite sample used to discard the whole order. The
+    # weighted extraction returns NaN for any row whose aperture runs off
+    # the edge of the detector, which happens on the bluest and reddest
+    # orders, so one such row was costing exactly the orders with the
+    # fewest lines to spare. Short gaps are interpolated across for the
+    # peak finding and the fits, and any line whose window touches a gap
+    # is dropped afterwards.
+    finite = np.isfinite(s)
+    if not finite.any():
         return None
+    if not finite.all():
+        if finite.sum() < max(continuum_window, 3 * half_window):
+            return None
+        s = np.interp(np.arange(len(s)), np.flatnonzero(finite), s[finite])
 
     continuum = median_filter(s, continuum_window)
     resid = s - continuum
@@ -406,8 +461,22 @@ def detect_arc_lines(spectrum, expected_sigma_pixels=3.3, detection_sigma=7.0,
     if noise <= 0:
         return np.zeros((0, 6))
 
-    peaks, _ = find_peaks(resid, prominence=detection_sigma * noise,
-                          distance=min_separation)
+    # Local noise, so the threshold follows the blaze. One number for the
+    # whole order is too strict where the order is faint and too loose at
+    # its peak, and the faint ends are where pixel coverage and order
+    # overlap are decided.
+    if getattr(config, "ARC_LOCAL_NOISE", True):
+        local = 1.4826 * median_filter(np.abs(resid - median_filter(resid, 51)),
+                                       size=continuum_window)
+        # never let a quiet stretch drive the threshold below the read
+        # noise of the order as a whole
+        prominence = detection_sigma * np.maximum(local, 0.35 * noise)
+    else:
+        prominence = detection_sigma * noise
+
+    peaks, _ = find_peaks(resid, prominence=prominence, distance=min_separation)
+
+    sloped = getattr(config, "ARC_LINE_LINEAR_BACKGROUND", True)
 
     out = []
     for p in peaks:
@@ -417,27 +486,39 @@ def detect_arc_lines(spectrum, expected_sigma_pixels=3.3, detection_sigma=7.0,
         hi = min(len(s), p + half_window + 1)
         if hi - lo < 7:
             continue
+        if not finite[lo:hi].all():
+            continue                      # this window was interpolated, not measured
         x = np.arange(lo, hi)
-        y = resid[lo:hi]
+        if sloped:
+            # Fit the raw spectrum with the background as a free slope.
+            # Subtracting a running median first leaves a tilted pedestal
+            # under the line, and a tilt under a symmetric Gaussian moves
+            # its fitted centre.
+            y = s[lo:hi]
+            base = np.median(y)
+            p0 = (max(resid[p], 1e-6), float(p), expected_sigma_pixels, base, 0.0)
+            model_fn = _gaussian_sloped
+        else:
+            y = resid[lo:hi]
+            p0 = (y.max(), float(p), expected_sigma_pixels, 0.0)
+            model_fn = _gaussian
         try:
-            popt, pcov = curve_fit(_gaussian, x, y,
-                                   p0=(y.max(), float(p), expected_sigma_pixels, 0.0))
-        except Exception:
+            popt, pcov = curve_fit(model_fn, x, y, p0=p0)
+        except (RuntimeError, ValueError, TypeError):
             continue
-        amp, mu, sigma, _ = popt
-        sigma = abs(sigma)
+        amp, mu, sigma = popt[0], popt[1], abs(popt[2])
         if amp <= 0 or not (lo + 1 < mu < hi - 1):
             continue
         if not (width_tolerance[0] * expected_sigma_pixels < sigma
                 < width_tolerance[1] * expected_sigma_pixels):
             continue
-        model = _gaussian(x, *popt)
+        model = model_fn(x, *popt)
         frac_resid = np.sqrt(np.mean((y - model) ** 2)) / amp
         if frac_resid > max_fit_residual:
             continue
         try:
             pixel_err = float(np.sqrt(abs(pcov[1, 1])))
-        except Exception:
+        except (IndexError, TypeError, ValueError):
             pixel_err = np.nan
         if not np.isfinite(pixel_err) or pixel_err <= 0:
             pixel_err = 1.0
@@ -1310,7 +1391,11 @@ def match_lines(model, detections, order_numbers, reference, n_pixels,
     ref_eff = reference.eff_wave
 
     for i, det in enumerate(detections):
-        if det is None or len(det) == 0:
+        # An order can be traced and have its lines detected while still
+        # carrying no order number, which is what a trace outside the
+        # master's range gets. float(None) raises, so this used to take
+        # the whole night's reduction down over one extra edge trace.
+        if det is None or len(det) == 0 or order_numbers[i] is None:
             continue
         m = float(order_numbers[i])
         mu = det[:, DET_PIXEL]
@@ -1415,20 +1500,76 @@ def fit_solution(matches, n_pixels, m_degree=2, correction_degree=None,
     solution = None
     residuals = np.zeros(len(matches))
 
+    joint = (correction_degree is not None
+             and getattr(config, "JOINT_CORRECTION_FIT", True))
+    n_physical = 3 * (m_degree + 1)
+
+    # The correction's own m-only columns duplicate the physical basis.
+    # design() emits {1, u/d, f/d} x m_hat**j, and its first group is
+    # {m_hat**0 ... m_hat**m_degree}; chebvander2d's first pixel group is
+    # T_0(y_hat) * T_j(m_hat) for j = 0 .. degree_m, which spans functions
+    # of m_hat alone up to degree_m. Stacking both makes the system rank
+    # deficient, so the duplicates are dropped and the physical terms keep
+    # them.
+    #
+    # Only the overlap duplicates: the two groups share polynomials up to
+    # min(m_degree, degree_m). Dropping the whole first group instead
+    # would throw away degree_m - m_degree columns that nothing else
+    # spans, which is real freedom lost, and choose_degrees puts four such
+    # combinations on its grid.
+    correction_keep = None
+    if correction_degree is not None:
+        n_correction = (correction_degree[0] + 1) * (correction_degree[1] + 1)
+        duplicated = min(correction_degree[1], m_degree)
+        correction_keep = np.arange(n_correction) > duplicated
+
+    def correction_matrix(trial, pixel, m):
+        return C.chebvander2d(trial._y_hat(pixel), trial._m_hat(m), correction_degree)
+
     def best_focal(grid):
+        """Scan the focal length against the physical terms alone.
+
+        Deliberately without the correction. The correction can imitate
+        the curvature the physical basis loses as f grows, so including
+        it here leaves f almost unconstrained and it wanders off to the
+        bound, taking the meaning of focal_pixels and the FOCAL_LIMITS
+        sanity check with it. f is a property of the camera, so it is
+        measured from the part of the model that describes the camera.
+        """
         best = None
+        sw = np.sqrt(matches.weight[keep])
+        target = matches.m_lambda[keep] * sw
         for f in grid:
-            trial = WavelengthSolution(f, np.zeros(3 * (m_degree + 1)), m_degree,
+            trial = WavelengthSolution(f, np.zeros(n_physical), m_degree,
                                        n_pixels, m_min, m_max)
             A = trial.design(matches.pixel[keep], matches.m[keep])
-            sw = np.sqrt(matches.weight[keep])
-            coef, *_ = np.linalg.lstsq(A * sw[:, None], matches.m_lambda[keep] * sw,
-                                       rcond=None)
+            coef, *_ = np.linalg.lstsq(A * sw[:, None], target, rcond=None)
             r = matches.m_lambda[keep] - A @ coef
             chi = np.sqrt(np.average(r ** 2, weights=matches.weight[keep]))
             if best is None or chi < best[0]:
                 best = (chi, f, coef)
         return best
+
+    def solve_together(trial):
+        """Refit the physical and correction coefficients in one system.
+
+        Fitting the correction to what the physical fit left behind is
+        one step of backfitting, which only reaches the least-squares
+        optimum when the two bases are orthogonal, and these are not. At
+        a fixed focal length both sets of coefficients are linear, so the
+        optimum is one lstsq call away.
+        """
+        A = trial.design(matches.pixel[keep], matches.m[keep])
+        V = correction_matrix(trial, matches.pixel[keep], matches.m[keep])
+        A = np.hstack([A, V[:, correction_keep]])
+        sw = np.sqrt(matches.weight[keep])
+        coef, *_ = np.linalg.lstsq(A * sw[:, None],
+                                   matches.m_lambda[keep] * sw, rcond=None)
+        trial.coefficients = coef[:n_physical]
+        flat = np.zeros((correction_degree[0] + 1) * (correction_degree[1] + 1))
+        flat[correction_keep] = coef[n_physical:]
+        trial.correction = flat.reshape(correction_degree[0] + 1,
+                                        correction_degree[1] + 1)
 
     for _ in range(max_iterations):
         # Full range every time, then a local refinement. Starting from
@@ -1441,20 +1582,41 @@ def fit_solution(matches, n_pixels, m_degree=2, correction_degree=None,
         if coarse[0] < best[0]:
             best = coarse
 
-        solution = WavelengthSolution(best[1], best[2], m_degree, n_pixels, m_min, m_max)
+        solution = WavelengthSolution(best[1], best[2], m_degree, n_pixels,
+                                      m_min, m_max)
 
         if correction_degree is not None:
-            resid = matches.m_lambda - solution.m_lambda(matches.pixel, matches.m)
-            V = C.chebvander2d(solution._y_hat(matches.pixel[keep]),
-                               solution._m_hat(matches.m[keep]), correction_degree)
-            sw = np.sqrt(matches.weight[keep])
-            cc, *_ = np.linalg.lstsq(V * sw[:, None], resid[keep] * sw, rcond=None)
-            solution.correction = cc.reshape(correction_degree[0] + 1,
-                                             correction_degree[1] + 1)
+            if joint:
+                solve_together(solution)
+            else:
+                # the original two-stage fit: the correction takes what
+                # the physical terms left behind, and they are not refitted
+                resid = matches.m_lambda - solution.m_lambda(matches.pixel, matches.m)
+                V = correction_matrix(solution, matches.pixel[keep], matches.m[keep])
+                sw = np.sqrt(matches.weight[keep])
+                cc, *_ = np.linalg.lstsq(V * sw[:, None], resid[keep] * sw, rcond=None)
+                solution.correction = cc.reshape(correction_degree[0] + 1,
+                                                 correction_degree[1] + 1)
 
         residuals = matches.m_lambda - solution.m_lambda(matches.pixel, matches.m)
-        scatter = 1.4826 * np.median(np.abs(residuals[keep] - np.median(residuals[keep])))
-        new_keep = np.abs(residuals) < clip_sigma * max(scatter, 1e-12)
+
+        # Clip on the residual divided by its own uncertainty. Residuals
+        # are in m*lambda, so at equal wavelength accuracy a line in the
+        # bluest order carries 2.6x the residual of one in the reddest
+        # here, and a single cut in m*lambda would clip the blue orders
+        # hardest while letting the red ones through.
+        if getattr(config, "WEIGHTED_CLIPPING", True):
+            # About the median rather than about zero. The two agree
+            # whenever the model's constant term has pulled the residuals
+            # onto zero, which is the usual case, and differ exactly when
+            # it has not: a pass where the matches are still one-sided.
+            statistic = residuals * np.sqrt(matches.weight)
+            centre = np.median(statistic[keep])
+        else:
+            statistic = residuals
+            centre = 0.0
+        scatter = 1.4826 * np.median(np.abs(statistic[keep] - np.median(statistic[keep])))
+        new_keep = np.abs(statistic - centre) < clip_sigma * max(scatter, 1e-12)
         if new_keep.sum() == keep.sum() and np.array_equal(new_keep, keep):
             break
         keep = new_keep
@@ -1800,7 +1962,8 @@ def choose_degrees(matches, keep, n_pixels,
 def overlap_agreement(orders, solution, spectrum_attr="thar_spectrum",
                       pixel_shift=0.0, velocity_ms=0.0,
                       min_overlap_angstrom=2.0, max_velocity_ms=20000.0,
-                      oversample=5.0, min_contrast=3.0):
+                      oversample=5.0, min_contrast=3.0,
+                      tilt=0.0, tilt_reference_m=0.0):
     """Measure whether adjacent orders agree, without using the atlas.
 
     Where two orders overlap they record the same lamp lines on different
@@ -1825,6 +1988,12 @@ def overlap_agreement(orders, solution, spectrum_attr="thar_spectrum",
         evaluated, in pixels. Default 0.0.
     velocity_ms : float, optional
         Velocity in m/s divided out of each axis. Default 0.0.
+    tilt : float, optional
+        Change in pixel_shift per unit order number, in pixels per order.
+        Default 0.0, meaning one rigid shift for every order.
+    tilt_reference_m : float, optional
+        Order number pixel_shift belongs to. Default 0.0. Ignored when
+        tilt is 0.
     min_overlap_angstrom : float, optional
         Least wavelength overlap worth correlating, in Angstrom.
         Default 2.0.
@@ -1850,7 +2019,10 @@ def overlap_agreement(orders, solution, spectrum_attr="thar_spectrum",
     usable.sort(key=lambda o: -o.order_number)
 
     def axis_of(order, n):
-        pixels = np.arange(n) - pixel_shift
+        shift = pixel_shift
+        if tilt:
+            shift = pixel_shift + tilt * (order.order_number - tilt_reference_m)
+        pixels = np.arange(n) - shift
         w = solution.wavelength(pixels, np.full(n, float(order.order_number)))
         return w / (1.0 + velocity_ms / C_LIGHT_MS)
 
@@ -1875,6 +2047,15 @@ def overlap_agreement(orders, solution, spectrum_attr="thar_spectrum",
         grid = np.arange(np.log(lo), np.log(hi), step)
         if len(grid) < 128:
             continue
+        # np.interp needs its sample points increasing and does not check;
+        # given a decreasing axis it returns the end value everywhere
+        # rather than raising, so this gate would go on reporting
+        # plausible numbers while testing nothing. measure_frame_shift
+        # already guards this and overlap_agreement was missed.
+        if wa[0] > wa[-1]:
+            wa, spec_a = wa[::-1], np.asarray(spec_a)[::-1]
+        if wb[0] > wb[-1]:
+            wb, spec_b = wb[::-1], np.asarray(spec_b)[::-1]
         fa = np.interp(np.exp(grid), wa, spec_a)
         fb = np.interp(np.exp(grid), wb, spec_b)
         fa = fa - median_filter(fa, max(9, len(fa) // 8) | 1)
@@ -2289,13 +2470,22 @@ def diagnose_frame_offset(orders, solution, shift_pixels, spectrum_attr="science
 # applying the solution to the orders
 # ======================================================================
 
-def attach_solution(orders, solution, pixel_shift=0.0, velocity_ms=0.0, quiet=False):
+def attach_solution(orders, solution, pixel_shift=0.0, velocity_ms=0.0, quiet=False,
+                    tilt=0.0, tilt_reference_m=None):
     """Give every numbered order a callable pixel -> wavelength.
 
     Sets wavelength_poly in place on each order that has an order number.
     Both corrections default to zero, which is the arc frame: observed
     wavelengths exactly as measured, and what is saved as the master.
     Move away from it only for a reason diagnose_frame_offset supports.
+
+    Flexure does not always move every order by the same amount. Where a
+    tilt is supplied the shift becomes
+
+        shift(m) = pixel_shift + tilt * (m - tilt_reference_m)
+
+    which is what measure_arc_shift already fits across the orders; a
+    tilt of zero reproduces the single rigid shift exactly.
 
     Parameters
     ----------
@@ -2305,29 +2495,45 @@ def attach_solution(orders, solution, pixel_shift=0.0, velocity_ms=0.0, quiet=Fa
     solution : WavelengthSolution
         Surface to slice per order.
     pixel_shift : float, optional
-        Shift applied to the pixel coordinate, in pixels. Default 0.0.
+        Shift applied to the pixel coordinate, in pixels, at
+        tilt_reference_m. Default 0.0.
     velocity_ms : float, optional
         Velocity in m/s divided out of the axis. Default 0.0.
     quiet : bool, optional
         Suppress the summary line. Default False.
+    tilt : float, optional
+        Change in the shift per unit order number, in pixels per order.
+        Default 0.0, meaning one rigid shift for every order.
+    tilt_reference_m : float, optional
+        Order number the shift was measured at. Default None, meaning the
+        mean order number of the numbered orders. Ignored when tilt is 0.
 
     Returns
     -------
     None
         The orders are modified in place.
     """
+    numbered = [o for o in orders if o.order_number is not None]
+    if tilt and tilt_reference_m is None and numbered:
+        tilt_reference_m = float(np.mean([o.order_number for o in numbered]))
+
     n = 0
-    for order in orders:
-        if order.order_number is None:
-            continue
+    for order in numbered:
+        shift = pixel_shift
+        if tilt:
+            shift = pixel_shift + tilt * (order.order_number - tilt_reference_m)
         order.wavelength_poly = OrderWavelength(solution, order.order_number,
-                                                pixel_shift=pixel_shift,
+                                                pixel_shift=shift,
                                                 velocity_ms=velocity_ms)
         n += 1
     if not quiet:
         extra = ""
         if pixel_shift:
             extra += f" (shifted {pixel_shift:+.2f} px)"
+        if tilt and numbered:
+            span = tilt * (max(o.order_number for o in numbered)
+                           - min(o.order_number for o in numbered))
+            extra += f" (tilted {span:+.2f} px end to end)"
         if velocity_ms:
             extra += f" (rest frame, {velocity_ms / 1000:+.1f} km/s removed)"
         print(f"attach_solution: wavelength axis attached to {n} orders{extra}")
@@ -2497,6 +2703,19 @@ def save_solution(path, solution, orders, report=None, white=None, atlas_path=No
         ],
         "quality": None if report is None else {"checks": report.checks,
                                                 "stats": report.stats},
+        # How the frames behind this master were prepared. The saved
+        # reference arc spectra are what every later night is
+        # cross-correlated against, so a master built with the flat field
+        # on has to be used with it on: a pixel response is a fixed
+        # multiplicative pattern, and correcting one side of that
+        # correlation and not the other leaves a mismatch in every shift.
+        # load_master checks these against config and says so.
+        "processing": {
+            "flat_field": bool(getattr(config, "FLAT_FIELD", False)),
+            "flat_field_arcs": bool(getattr(config, "FLAT_FIELD_ARCS", True)),
+            "apply_bias": bool(getattr(config, "APPLY_BIAS", False)),
+            "apply_dark": bool(getattr(config, "APPLY_DARK", False)),
+        },
     }
     with open(path, "wb") as f:
         pickle.dump(payload, f)
