@@ -12,6 +12,8 @@ Main entry point: build_master.
 """
 
 import os
+
+
 import shutil
 from datetime import datetime
 
@@ -19,6 +21,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import config
+import flat_field
 import frames
 import wavelength_solution as ws
 from order_tracing import trace_orders
@@ -157,6 +160,14 @@ def build_master(white_loc, arc_file, science_file, nad_pixel_guesses=None,
     orders, white = trace_orders(white_loc)
     n_pixels = white.shape[0]
 
+    # The master's own reference arc has to be reduced the way the arcs
+    # registered against it will be. A pixel response is a fixed
+    # multiplicative pattern, so correcting one side and not the other
+    # leaves a mismatch in every later cross-correlation.
+    if config.FLAT_FIELD:
+        print()
+        flat_field.flat_field_orders(orders, white)
+
     arc_image = frames.read_image(arc_file)
     science_image = frames.read_image(science_file)
     print("Extracting spectra along every trace ...")
@@ -165,6 +176,12 @@ def build_master(white_loc, arc_file, science_file, nad_pixel_guesses=None,
                                                  n_sigma=config.ARC_EXTRACT_NSIGMA)
         order.science_spectrum = order.extract_weighted(
             science_image, n_sigma=config.SCIENCE_EXTRACT_NSIGMA)
+    if config.FLAT_FIELD:
+        if config.FLAT_FIELD_ARCS:
+            flat_field.apply_pixel_response(orders, "thar_spectrum",
+                                            response_attr="pixel_response_arc",
+                                            verbose=False)
+        flat_field.apply_pixel_response(orders, "science_spectrum", verbose=False)
 
     # --- order numbers --------------------------------------------------
     K = ws.compute_grating_K(config.BLAZE_ANGLE_DEG, config.GROOVE_DENSITY_MM)
@@ -190,7 +207,8 @@ def build_master(white_loc, arc_file, science_file, nad_pixel_guesses=None,
     # --- lock -----------------------------------------------------------
     print()
     detections = ws.detect_all_orders(
-        orders, expected_sigma_pixels=config.EXPECTED_LINE_SIGMA_PIXELS)
+        orders, expected_sigma_pixels=config.EXPECTED_LINE_SIGMA_PIXELS,
+        saturation=config.ARC_SATURATION)
     order_numbers = [o.order_number for o in orders]
 
     print()
