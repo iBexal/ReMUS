@@ -61,6 +61,13 @@ DIRECTION = -1
 # The orders whose identification is trusted, as (trace index, wavelength).
 # These are the only things fixing the absolute order numbers when a master
 # is built. Both must imply the same m0 or the build stops.
+# These are AIR wavelengths, which is what ATLAS_AIR below exists to match.
+# Their absolute values barely matter here -- they are divided into K and
+# rounded to an integer -- but the same numbers are reused as the stellar
+# anchors in measure_frame_shift, where they are compared against the
+# solution directly. There, 4861.30 is about 25 mA (1.5 km/s) short of the
+# published air value of 4861.325; H-alpha and Na D are within 1 mA.
+# Left as they are, since only the stellar check sees the difference.
 ANCHORS = [(50, 6562.8),    # H-alpha
            (20, 4861.3)]    # H-beta
 
@@ -89,6 +96,22 @@ ARC_SATURATION = 55000.0
 # against a resolution element of a tenth of one.
 ATLAS_AMPLITUDE_MIN = 150.0
 ATLAS_DOMINANCE = 4.0
+
+# The ThAr line list ships in VACUUM wavelengths (it came from PyPeIt).
+# True converts it to standard air as it is read, in load_atlas, which is
+# the only place absolute wavelengths enter the pipeline. Everything
+# downstream is then on that scale: the fitted surface, the saved master,
+# and the wavelength arrays in every reduced .npz.
+#
+# It has to agree with ANCHORS and NAD_LINES above, which hold the classic
+# AIR values. Mixing the two is a near-constant 83 km/s across every line,
+# and because it is the same velocity everywhere the order-overlap check
+# cannot see it; it shows up only in the stellar-line check, where it looks
+# exactly like a Doppler shift.
+#
+# Flipping this means rebuilding the master. The setting is recorded in the
+# master and in every reduced file, and load_master says so if they differ.
+ATLAS_AIR = True
 
 # ----------------------------------------------------------------------
 # Choosing an arc

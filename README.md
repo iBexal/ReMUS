@@ -35,7 +35,7 @@ code/
     find_anchors.py       RUN: identify the anchor orders (once per spectrograph)
     make_master_thar.py   RUN: build a master (once per instrument configuration)
   thar_linelist/
-    ThAr_lines.dat        the ThAr line list (VACUUM wavelengths)
+    ThAr_lines.dat        the ThAr line list (VACUUM; see ATLAS_AIR)
 
 calibration/              the master solution, its summary, and the archive
 reduced/                  calibrated spectra, one .npz per science frame
@@ -134,11 +134,26 @@ Everything in `config.py`. The settings most likely to need changing:
 | `BLAZE_ANGLE_DEG`, `GROOVE_DENSITY_MM` | grating parameters, used for the order-number cross-check |
 | `EXPECTED_LINE_SIGMA_PIXELS` | instrumental profile sigma in pixels |
 | `ATLAS_AMPLITUDE_MIN`, `ATLAS_DOMINANCE` | how strong and how isolated an atlas line must be |
+| `ATLAS_AIR` | convert the atlas from vacuum to air as it is read |
 | `INTERPOLATE_BETWEEN_ARCS`, `MAX_ARC_GAP_MINUTES` | arc selection by time |
 | `CLEAN_COSMIC_RAYS`, `COSMIC_RAY_MAX_WIDTH`, `COSMIC_RAY_SIGMA` | spike removal |
 | `APPLY_BIAS`, `APPLY_DARK`, `MASTER_BIAS`, `MASTER_DARK` | detector calibration at read-in |
 | `FLAT_FIELD`, `FLAT_SMOOTH_WINDOW` | flat fielding from the white lamp |
 | `QUALITY`, `APPLY_QUALITY` | the pass/fail thresholds |
+
+## Air or vacuum
+
+`ThAr_lines.dat` ships in vacuum wavelengths, from PyPeIt. `ANCHORS` and
+`NAD_LINES` hold the classic air values: 6562.80, 4861.30, 5889.95, 5895.92.
+Those two scales differ by about 0.028%, which is **83 km/s**. The atlas being vacuum and test lines being air do not matter, although it may display a test radial velocity for the star that seems unphysical - the wavelength solution is still correct. 
+
+`ATLAS_AIR = True` converts the atlas to standard air in `load_atlas`, using
+the Ciddor relation that PyPeIt, astropy and IDLastro all share. If your stellar linelist is in air, it is easier to convert the ThAr atlas to air, than the other way around.
+
+The setting is recorded in the master, printed in the summary as `wavelengths
+AIR` or `VACUUM`, and written into each `.npz` as `wavelength_scale`.
+`load_master` refuses to be quiet if tonight's setting disagrees with the
+master's. **You MUST rebuild the master if this setting is changed.**
 
 ## Bias, dark and flat
 
@@ -237,6 +252,7 @@ together.
 | `pixel_shift_reference_m` | scalar | order number `pixel_shift` belongs to |
 | `blaze` | (n_orders, n_pixels) | smooth part of the white lamp; only when flat fielding |
 | `flat_fielded`, `bias_subtracted`, `dark_subtracted` | scalar | what was applied |
+| `wavelength_scale` | scalar | `"air"` or `"vacuum"`, from `ATLAS_AIR` |
 
 ```python
 import numpy as np

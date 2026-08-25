@@ -176,6 +176,110 @@ def check_trace_spacing(orders, tolerance=0.35):
 # ThAr atlas
 # ======================================================================
 
+def _air_refractive_index(wave_vacuum):
+    """Refractive index of standard air at a vacuum wavelength.
+
+    Ciddor (1996) in the form used by IDLastro's vactoair, astropy and
+    PyPeIt, so an atlas taken from PyPeIt is converted back with the same
+    relation it was converted forward with.
+
+        n = 1 + 5.792105e-2/(238.0185 - s^2) + 1.67917e-3/(57.362 - s^2)
+
+    with s = 1e4 / lambda_vacuum, in inverse microns. Standard air means
+    dry air at 15 C and 101.325 kPa; the residual dependence on the air
+    in the actual room is far below anything this pipeline can measure.
+
+    Edlen (1966) and Morton (2000) are the other two relations in common
+    use. Over 4000-7500 A all three agree to better than 0.1 mA, against
+    a fitted line residual of about 2.7 mA, so the choice does not matter
+    here.
+
+    Parameters
+    ----------
+    wave_vacuum : ndarray or float
+        Vacuum wavelength in Angstrom. Must be above 2000 A; the poles of
+        the formula sit deep in the ultraviolet, at 1320 A and 648 A.
+
+    Returns
+    -------
+    n : ndarray
+        Refractive index, a little above 1.
+
+    Raises
+    ------
+    ValueError
+        If any wavelength is at or below 2000 A, where this relation does
+        not apply.
+    """
+    wave = np.asarray(wave_vacuum, float)
+    # NaN fails every comparison, so testing `wave <= 2000` lets it
+    # through, and it would then pass the monotonicity check downstream
+    # for the same reason and land silently in the reference list.
+    if not np.all(np.isfinite(wave)):
+        raise ValueError(
+            f"{int(np.sum(~np.isfinite(wave)))} of {wave.size} wavelengths are not "
+            f"finite. A NaN here would pass every range check and end up in the "
+            f"reference line list, so the line list is rejected instead.")
+    if np.any(wave <= 2000.0):
+        raise ValueError(
+            "the air refractive index used here is only valid above 2000 A, and "
+            f"the shortest wavelength given is {np.min(wave):.1f} A.")
+    s2 = (1e4 / wave) ** 2
+    return 1.0 + 5.792105e-2 / (238.0185 - s2) + 1.67917e-3 / (57.362 - s2)
+
+
+def vacuum_to_air(wave_vacuum):
+    """Convert vacuum wavelengths to standard air.
+
+    The easy direction: the refractive index is a function of the vacuum
+    wavelength, which is the number in hand, so this is one division with
+    nothing to iterate.
+
+    Parameters
+    ----------
+    wave_vacuum : ndarray or float
+        Vacuum wavelength in Angstrom.
+
+    Returns
+    -------
+    wave_air : ndarray
+        Air wavelength in Angstrom, shorter than the input by about
+        0.028%: 1.8 A at H-alpha, 1.4 A at H-beta.
+    """
+    wave = np.asarray(wave_vacuum, float)
+    return wave / _air_refractive_index(wave)
+
+
+def air_to_vacuum(wave_air, iterations=3):
+    """Convert standard air wavelengths to vacuum.
+
+    The awkward direction, because the refractive index wants the vacuum
+    wavelength and that is what is being solved for. Iterating converges
+    immediately, since n changes by parts in a million across the step:
+    three passes are already exact to well under a micro-Angstrom.
+
+    Provided so the two directions live together and can be checked
+    against each other. The pipeline itself only needs vacuum_to_air.
+
+    Parameters
+    ----------
+    wave_air : ndarray or float
+        Air wavelength in Angstrom.
+    iterations : int, optional
+        Fixed-point iterations. Default 3.
+
+    Returns
+    -------
+    wave_vacuum : ndarray
+        Vacuum wavelength in Angstrom.
+    """
+    air = np.asarray(wave_air, float)
+    wave = air.copy()
+    for _ in range(iterations):
+        wave = air * _air_refractive_index(wave)
+    return wave
+
+
 class ReferenceLines:
     """Atlas lines usable for calibration, sorted by wavelength.
 
@@ -205,9 +309,21 @@ class ReferenceLines:
         return len(self.wave)
 
 
-def load_atlas(path, ion_prefix="Th", amplitude_min=10.0):
-    """Read a ThAr line list in the '|'-delimited. The lines
-    are in VACUUM wavelengths (from pypeit).
+def load_atlas(path, ion_prefix="Th", amplitude_min=10.0, to_air=None):
+    """Read a ThAr line list in the '|'-delimited format.
+
+    The file holds VACUUM wavelengths (it came from PyPeIt). With
+    config.ATLAS_AIR set they are converted to standard air as they are
+    read, and nothing downstream needs to know: the atlas is the only
+    place absolute wavelengths enter the pipeline, so converting here
+    puts the fitted surface, the saved axes and the rest wavelengths in
+    config on one scale.
+
+    That scale has to match config.ANCHORS and config.NAD_LINES, which
+    hold the classic air values (6562.80, 4861.30, 5889.95, 5895.92).
+    Mixing the two is a near-constant 83 km/s across every line, which
+    passes the order-overlap check untouched and shows up only in the
+    stellar-line check, where it looks exactly like a Doppler shift.
 
     Ar lines are dropped by default; they blend and shift more readily
     than Th lines. The complete list is returned as well, because the
@@ -221,6 +337,9 @@ def load_atlas(path, ion_prefix="Th", amplitude_min=10.0):
         Keep only ions whose name starts with this prefix. Default "Th".
     amplitude_min : float, optional
         Keep only lines with amplitude above this value. Default 10.0.
+    to_air : bool, optional
+        Convert the file's vacuum wavelengths to standard air. Default
+        None, meaning config.ATLAS_AIR.
 
     Returns
     -------
@@ -233,6 +352,9 @@ def load_atlas(path, ion_prefix="Th", amplitude_min=10.0):
     full_amplitude : ndarray
         Amplitudes of every line in the file.
     """
+    if to_air is None:
+        to_air = getattr(config, "ATLAS_AIR", False)
+
     atlas = pd.read_csv(path, delimiter="|")
     atlas.columns = [c.strip() for c in atlas.columns]
     atlas["ion"] = atlas["ion"].str.strip()
@@ -240,6 +362,38 @@ def load_atlas(path, ion_prefix="Th", amplitude_min=10.0):
 
     full_wave = atlas["wave"].values.astype(float)
     full_amp = atlas["amplitude"].values.astype(float)
+
+    # An empty list is a broken file, not an empty result. Left to run on,
+    # it would surface hundreds of lines later as "no orders have enough
+    # detected ThAr lines", which points at the data rather than the file.
+    if len(full_wave) == 0:
+        raise ValueError(
+            f"no lines were read from {path}. The file should be '|'-delimited "
+            f"with ion, wave and amplitude columns; a truncated download or a "
+            f"changed delimiter both look like this.")
+
+    if to_air:
+        vacuum = full_wave
+        # Monotonic over the optical, so the sort survives; asserted
+        # rather than assumed, because everything downstream searchsorts
+        # into this array.
+        full_wave = vacuum_to_air(vacuum)
+        if np.any(np.diff(full_wave) < 0):
+            raise ValueError("the air conversion did not preserve the wavelength order")
+        if len(vacuum):
+            mid = len(vacuum) // 2
+            print(f"load_atlas: converted {len(vacuum)} vacuum wavelengths to standard "
+                  f"air ({vacuum[mid]:.3f} -> {full_wave[mid]:.3f} A, "
+                  f"{full_wave[mid] - vacuum[mid]:+.3f} A = "
+                  f"{C_LIGHT_MS * (full_wave[mid] - vacuum[mid]) / vacuum[mid] / 1000:+.1f}"
+                  f" km/s)")
+        else:
+            print("load_atlas: the line list is empty. Check the path and that the "
+                  "file really is '|'-delimited with ion/wave/amplitude columns.")
+    else:
+        print("load_atlas: wavelengths left in VACUUM. config.ANCHORS and "
+              "config.NAD_LINES hold air values, so the stellar-line check will "
+              "read about +83 km/s that is not the star. Set config.ATLAS_AIR.")
 
     keep = atlas["ion"].str.startswith(ion_prefix).values & (full_amp > amplitude_min)
     print(f"load_atlas: {len(atlas)} lines, kept {keep.sum()} with ion '{ion_prefix}*' "
@@ -2715,6 +2869,11 @@ def save_solution(path, solution, orders, report=None, white=None, atlas_path=No
             "flat_field_arcs": bool(getattr(config, "FLAT_FIELD_ARCS", True)),
             "apply_bias": bool(getattr(config, "APPLY_BIAS", False)),
             "apply_dark": bool(getattr(config, "APPLY_DARK", False)),
+            # Which scale this master's wavelengths are on. Rebuilding
+            # with ATLAS_AIR flipped moves every wavelength by about
+            # 83 km/s, and because it moves them all by the same velocity
+            # nothing else in the pipeline can see it.
+            "atlas_air": bool(getattr(config, "ATLAS_AIR", False)),
         },
     }
     with open(path, "wb") as f:

@@ -12,8 +12,6 @@ Main entry point: build_master.
 """
 
 import os
-
-
 import shutil
 from datetime import datetime
 
@@ -90,6 +88,10 @@ def _write_summary(path, solution, orders, report, sources, shift_note):
         f"orders fitted    {solution.m_max:.0f} down to {solution.m_min:.0f}"
         ,
         f"camera focal     {solution.focal_pixels:.0f} px",
+        # 83 km/s hangs on this, and nothing about the numbers below
+        # reveals it, so it is stated where the numbers are.
+        f"wavelengths      {'AIR' if config.ATLAS_AIR else 'VACUUM'} "
+        f"(ATLAS_AIR = {config.ATLAS_AIR})",
         "",
         "quality",
         "-" * 60,

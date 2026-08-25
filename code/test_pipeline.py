@@ -518,11 +518,6 @@ check("applying the response changes the spectra but keeps their level",
           for a, o in zip(before, traced)))
 config.FLAT_FIELD = False
 
-print("\n" + "=" * 60)
-if FAILURES:
-    print(f"{len(FAILURES)} FAILURE(S): " + ", ".join(FAILURES))
-    sys.exit(1)
-print("all checks passed")
 
 # =======================================================================
 print("\n10. regressions found in review")
@@ -651,6 +646,266 @@ try:
     check("a cached master cannot be written through", False, "the write succeeded")
 except ValueError:
     check("a cached master cannot be written through", True)
+
+# =======================================================================
+print("\n11. vacuum to air conversion of the ThAr atlas")
+# =======================================================================
+# Independent implementations of the same physics, to check the one in
+# the pipeline rather than restate it.
+def n_edlen1966(lv):
+    s2 = (1e4 / np.asarray(lv, float)) ** 2
+    return 1 + 1e-8 * (8342.13 + 2406030 / (130 - s2) + 15997 / (38.9 - s2))
+
+
+def n_morton2000(lv):
+    s2 = (1e4 / np.asarray(lv, float)) ** 2
+    return 1 + 8.34254e-5 + 2.406147e-2 / (130 - s2) + 1.5998e-4 / (38.9 - s2)
+
+
+probe = np.array([4165.0, 4861.3, 5890.0, 6563.0, 7300.0])
+air = ws.vacuum_to_air(probe)
+
+check("air wavelengths are shorter than vacuum", np.all(air < probe))
+frac = (probe - air) / probe
+check("the shift is about 0.028% everywhere",
+      np.all((frac > 2.7e-4) & (frac < 2.9e-4)),
+      f"{frac.min():.3e} to {frac.max():.3e}")
+
+# a constant velocity across the band is the signature that makes this
+# masquerade as a Doppler shift, so it is worth asserting
+vel = ws.C_LIGHT_MS * (probe - air) / probe / 1000.0
+check("the offset is a near-constant velocity, 82-85 km/s",
+      np.all((vel > 82) & (vel < 85)) and (vel.max() - vel.min()) < 2.5,
+      f"{vel.min():.1f} to {vel.max():.1f} km/s, spread {vel.max()-vel.min():.2f}")
+
+for name, fn in (("Edlen 1966", n_edlen1966), ("Morton 2000", n_morton2000)):
+    other = probe / fn(probe)
+    worst = np.max(np.abs(other - air)) * 1000.0
+    check(f"agrees with {name} to well under the line residual",
+          worst < 0.5, f"worst {worst:.3f} mA")
+
+back = ws.air_to_vacuum(air)
+check("air_to_vacuum inverts vacuum_to_air",
+      np.allclose(back, probe, atol=1e-9), f"max error {np.abs(back-probe).max():.3e} A")
+
+check("conversion is strictly increasing over the whole optical range",
+      np.all(np.diff(ws.vacuum_to_air(np.linspace(3000, 11000, 40001))) > 0))
+
+try:
+    ws.vacuum_to_air([1500.0])
+    check("far-UV wavelengths are refused", False, "no error raised")
+except ValueError:
+    check("far-UV wavelengths are refused", True)
+
+# Published catalogue pairs, both sides taken from references rather than
+# from each other, so a wrong constant in the conversion cannot hide.
+CATALOGUE = [("Na D2", 5891.5832, 5889.9509),
+             ("Na D1", 5897.5581, 5895.9242),
+             ("H-alpha", 6564.6140, 6562.8010),
+             ("H-beta", 4862.6830, 4861.3250)]
+worst_ma, rows = 0.0, []
+for name, vac, air_pub in CATALOGUE:
+    got = float(ws.vacuum_to_air(vac))
+    err = abs(got - air_pub) * 1000.0
+    worst_ma = max(worst_ma, err)
+    rows.append(f"{name} {err:.2f}")
+check("converts published vacuum values onto their published air values",
+      worst_ma < 1.5, f"worst {worst_ma:.2f} mA ({', '.join(rows)})")
+
+# config.ANCHORS / NAD_LINES against those same published air values
+CONFIG_LINES = [("Na D2", 5889.95, 5889.9509), ("Na D1", 5895.92, 5895.9242),
+                ("H-alpha", 6562.80, 6562.8010), ("H-beta", 4861.30, 4861.3250)]
+off = [(n, (cfg - pub) * 1000.0, ws.C_LIGHT_MS * (cfg - pub) / pub / 1000.0)
+       for n, cfg, pub in CONFIG_LINES]
+for n, ma, kms in off:
+    print(f"    config {n:8s} is {ma:+6.1f} mA = {kms:+5.2f} km/s from the "
+          f"published air value")
+# The bound catches a scale blunder (air vs vacuum is 1600 mA), not a
+# catalogue preference. The printed offsets above are the thing to read:
+# they go straight into measure_frame_shift, so anything approaching a
+# km/s is worth deciding about deliberately.
+check("config's rest wavelengths are on the air scale, not the vacuum one",
+      max(abs(ma) for _, ma, _ in off) < 200.0,
+      f"worst {max(abs(ma) for _, ma, _ in off):.0f} mA = "
+      f"{max(abs(k) for _, _, k in off):.2f} km/s")
+_worst_name, _worst_ma, _worst_kms = max(off, key=lambda r: abs(r[1]))
+if abs(_worst_ma) > 10.0:
+    print(f"    note: {_worst_name} is the furthest out at {_worst_ma:+.0f} mA "
+          f"({_worst_kms:+.2f} km/s). That is a catalogue choice, not a scale "
+          f"error, but it lands directly in the stellar-line check.")
+
+# --- load_atlas end to end, on a synthetic line list -------------------
+import io                                                        # noqa: E402
+import types as _types                                           # noqa: E402
+
+VAC = np.array([4200.0, 4862.6830, 5000.0, 5891.5832, 6564.6140, 7000.0, 7300.0])
+AMP = np.array([300.0, 900.0, 20.0, 800.0, 950.0, 400.0, 250.0])
+ION = ["Th I", "Th I", "Th I", "Th I", "Th I", "Ar I", "Th I"]
+atlas_path = os.path.join(TMP, "atlas.dat")
+with open(atlas_path, "w") as fh:
+    fh.write("ion|wave|amplitude\n")
+    for i, w in enumerate(VAC):
+        fh.write(f"{ION[i]}|{w}|{AMP[i]}\n")
+
+# pandas is stubbed at the top of this file, so give load_atlas a real
+# reader for just this check
+_real_pandas = sys.modules.get("pandas")
+
+
+class _Frame:
+    def __init__(self, rows):
+        self.rows = rows
+
+    @property
+    def columns(self):
+        return ["ion", "wave", "amplitude"]
+
+    @columns.setter
+    def columns(self, v):
+        pass
+
+    def sort_values(self, key):
+        return _Frame(sorted(self.rows, key=lambda r: float(r[1])))
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, k):
+        col = {"ion": 0, "wave": 1, "amplitude": 2}[k]
+        return _Col([r[col] for r in self.rows])
+
+    def __setitem__(self, k, v):
+        pass
+
+
+class _Col:
+    def __init__(self, v):
+        self.v = v
+
+    @property
+    def values(self):
+        if not self.v:
+            return np.array([], dtype=float)
+        if isinstance(self.v[0], bool):
+            return np.array(self.v, dtype=bool)
+        if isinstance(self.v[0], str):
+            return np.array(self.v, dtype=object)
+        return np.array(self.v, dtype=float)
+
+    @property
+    def str(self):
+        return self
+
+    def strip(self):
+        return _Col([x.strip() for x in self.v])
+
+    def startswith(self, p):
+        return _Col([str(x).startswith(p) for x in self.v])
+
+
+def _read_csv(path, delimiter="|"):
+    rows = []
+    with open(path) as fh:
+        next(fh)
+        for line in fh:
+            if line.strip():
+                rows.append([p.strip() for p in line.split("|")])
+    return _Frame(rows)
+
+
+fake_pd = _types.ModuleType("pandas")
+fake_pd.read_csv = _read_csv
+ws.pd = fake_pd
+
+config.ATLAS_AIR = False
+w_vac, a_vac, fw_vac, _ = ws.load_atlas(atlas_path, amplitude_min=10.0)
+config.ATLAS_AIR = True
+w_air, a_air, fw_air, _ = ws.load_atlas(atlas_path, amplitude_min=10.0)
+
+check("ATLAS_AIR off leaves the file's vacuum values alone",
+      np.allclose(np.sort(fw_vac), np.sort(VAC)))
+check("ATLAS_AIR on converts every line",
+      np.allclose(np.sort(fw_air), np.sort(ws.vacuum_to_air(VAC))))
+check("the same lines survive the ion and amplitude cuts either way",
+      len(w_air) == len(w_vac) and np.allclose(a_air, a_vac))
+check("the converted list is still sorted", np.all(np.diff(fw_air) > 0))
+check("Ar is still dropped", len(w_air) == 6 and not np.any(
+      np.isclose(w_air[:, None], ws.vacuum_to_air(7000.0)).any()))
+
+# the payoff: config's air rest wavelengths now line up with the atlas
+# The payoff, with catalogue vacuum in and catalogue air out. Tight enough
+# (2 mA = 0.1 km/s) that only a correct relation passes; the earlier version
+# fed in values back-computed from the config numbers, so it could not fail.
+for name, air_pub, vac_in_atlas in (("H-beta", 4861.3250, 4862.6830),
+                                    ("Na D2", 5889.9509, 5891.5832),
+                                    ("H-alpha", 6562.8010, 6564.6140)):
+    converted = float(ws.vacuum_to_air(vac_in_atlas))
+    check(f"{name} in the atlas converts onto its published air wavelength",
+          abs(converted - air_pub) < 0.002,
+          f"atlas {vac_in_atlas} -> {converted:.4f} vs published {air_pub}")
+
+# --- the cases the first pass of this suite did not reach ---------------
+empty_path = os.path.join(TMP, "atlas_empty.dat")
+with open(empty_path, "w") as fh:
+    fh.write("ion|wave|amplitude\n")
+for flag in (False, True):
+    config.ATLAS_AIR = flag
+    try:
+        ws.load_atlas(empty_path, amplitude_min=10.0)
+        check(f"an empty line list is refused clearly (ATLAS_AIR={flag})", False,
+              "no error raised; it would surface much later as 'no orders have "
+              "enough detected ThAr lines'")
+    except ValueError as exc:
+        check(f"an empty line list is refused clearly (ATLAS_AIR={flag})",
+              "delimited" in str(exc), str(exc))
+    except Exception as exc:
+        check(f"an empty line list is refused clearly (ATLAS_AIR={flag})", False,
+              f"{type(exc).__name__}: {exc}")
+
+one_path = os.path.join(TMP, "atlas_one.dat")
+with open(one_path, "w") as fh:
+    fh.write("ion|wave|amplitude\n")
+    fh.write("Th I|5891.5832|800.0\n")
+config.ATLAS_AIR = True
+w1, _, fw1, _ = ws.load_atlas(one_path, amplitude_min=10.0)
+check("a one-line list converts cleanly",
+      len(w1) == 1 and abs(float(w1[0]) - 5889.9509) < 0.002)
+
+try:
+    ws.vacuum_to_air([5000.0, np.nan, 6000.0])
+    check("a NaN wavelength is refused, not passed through", False, "no error raised")
+except ValueError:
+    check("a NaN wavelength is refused, not passed through", True)
+
+# select_reference_lines on the converted atlas: the np.isin float-equality
+# path, end to end rather than by inspection
+config.ATLAS_AIR = True
+sw, sa, fwv, fav = ws.load_atlas(atlas_path, amplitude_min=10.0)
+ref = ws.select_reference_lines(sw, sa, fwv, fav,
+                                lambda w: np.full_like(np.asarray(w, float), 0.2),
+                                amplitude_min=100.0, dominance=3.0)
+check("select_reference_lines still matches the selected lines after conversion",
+      len(ref) > 0 and np.all(np.isin(np.round(ref.wave, 6),
+                                      np.round(ws.vacuum_to_air(VAC), 6))),
+      f"{len(ref)} reference lines")
+check("reference wavelengths are on the air scale",
+      bool(np.all(ref.wave < ws.air_to_vacuum(ref.wave))))
+
+# the .npz label must follow the master, not tonight's config
+for master_flag, tonight, expect in ((True, False, "air"), (False, True, "vacuum"),
+                                     (True, True, "air"), (False, False, "vacuum")):
+    config.ATLAS_AIR = tonight
+    scale = rs._master_wavelength_scale({"processing": {"atlas_air": master_flag}})
+    check(f"npz scale follows the master (master={master_flag}, config={tonight})",
+          scale == expect, f"got {scale}")
+check("a master with no processing record is treated as vacuum",
+      rs._master_wavelength_scale({}) == "vacuum"
+      and rs._master_wavelength_scale(None) == "vacuum")
+
+if _real_pandas is not None:
+    ws.pd = _real_pandas
+config.ATLAS_AIR = False
+
 
 print("\n" + "=" * 60)
 if FAILURES:

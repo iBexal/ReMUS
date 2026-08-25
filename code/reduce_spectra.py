@@ -609,18 +609,28 @@ def load_master(path=None):
                   "how it was built. Its reference arcs are almost certainly not "
                   "flat fielded, and tonight's will be. Rebuild it, or clear "
                   "FLAT_FIELD.")
+        if config.ATLAS_AIR:
+            print("  WARNING: this master predates ATLAS_AIR, so it was built on the "
+                  "atlas as it comes, in VACUUM. ATLAS_AIR is now set, so tonight's "
+                  "atlas lines are in air and sit about 1.8 A from where this master "
+                  "puts them. Almost nothing will match. Rebuild the master.")
     else:
         now = {"flat_field": bool(config.FLAT_FIELD),
                "flat_field_arcs": bool(config.FLAT_FIELD_ARCS),
                "apply_bias": bool(config.APPLY_BIAS),
-               "apply_dark": bool(config.APPLY_DARK)}
-        differ = [k for k, v in now.items() if processing.get(k) != v]
+               "apply_dark": bool(config.APPLY_DARK),
+               "atlas_air": bool(config.ATLAS_AIR)}
+        # A key a master predates is a key that was off when it was built,
+        # not a mismatch. Without the default, a master written before
+        # ATLAS_AIR existed reports "master None, now False" and warns
+        # about an 83 km/s error when both sides are in fact vacuum.
+        differ = [k for k, v in now.items() if bool(processing.get(k, False)) != v]
         # only the arc path can bias the registration; the rest are noted
         arc_path_differs = [k for k in differ
                             if k in ("flat_field", "flat_field_arcs", "apply_bias")]
         if differ:
-            detail = ", ".join(f"{k}: master {processing.get(k)}, now {now[k]}"
-                               for k in differ)
+            detail = ", ".join(f"{k}: master {bool(processing.get(k, False))}, "
+                               f"now {now[k]}" for k in differ)
             print(f"  WARNING: this master was built with different settings "
                   f"({detail}).")
             if arc_path_differs:
@@ -628,6 +638,11 @@ def load_master(path=None):
                       "master's own, so preparing one and not the other leaves a "
                       "fixed mismatch in every measured shift. Match the settings "
                       "or rebuild the master.")
+            if "atlas_air" in differ:
+                print("    ATLAS_AIR decides what scale this master's wavelengths are "
+                      "on. Flipping it moves every one of them by about 83 km/s, and "
+                      "because it moves them all by the same velocity no internal "
+                      "check can see it. Match the setting or rebuild the master.")
     return saved
 
 
@@ -924,8 +939,29 @@ def _interpolated_shift(entries, when):
         f"to {t2:%H:%M} ({s2:+.2f} px)")
 
 
+def _master_wavelength_scale(saved):
+    """Return "air" or "vacuum" for the scale a master's axis is on.
+
+    A master built before ATLAS_AIR existed used the atlas exactly as it
+    comes, which is vacuum, so a missing record means vacuum rather than
+    unknown.
+
+    Parameters
+    ----------
+    saved : dict or None
+        Master solution as returned by load_master.
+
+    Returns
+    -------
+    scale : str
+        "air" or "vacuum".
+    """
+    processing = (saved or {}).get("processing") or {}
+    return "air" if processing.get("atlas_air", False) else "vacuum"
+
+
 def save_reduced(path, orders, science_path, arc_names, shift, tilt=0.0,
-                 tilt_reference_m=0.0):
+                 tilt_reference_m=0.0, saved=None):
     """Write the wavelength-calibrated orders of one science frame.
 
     Orders without an order number, a wavelength axis or a science
@@ -953,6 +989,10 @@ def save_reduced(path, orders, science_path, arc_names, shift, tilt=0.0,
     tilt_reference_m : float, optional
         Order number the shift belongs to, stored as
         "pixel_shift_reference_m". Default 0.0.
+    saved : dict, optional
+        Master solution as returned by load_master, used only to record
+        which wavelength scale the axis is on. Default None, meaning
+        "vacuum", which is what a master carrying no record of it is.
 
     Returns
     -------
@@ -979,7 +1019,17 @@ def save_reduced(path, orders, science_path, arc_names, shift, tilt=0.0,
         pixel_shift_reference_m=tilt_reference_m,
         flat_fielded=bool(config.FLAT_FIELD),
         bias_subtracted=bool(config.APPLY_BIAS),
-        dark_subtracted=bool(config.APPLY_DARK))
+        dark_subtracted=bool(config.APPLY_DARK),
+        # Which scale the wavelength array is on. Nothing about a spectrum
+        # reveals this from the outside, and it is 83 km/s, so it is
+        # written down rather than left to be remembered.
+        #
+        # Read from the master, not from config. The axis comes entirely
+        # from the master's fitted surface, so its scale was decided when
+        # that master was built; tonight's ATLAS_AIR says nothing about
+        # it, and using it would stamp an air label on a vacuum axis for
+        # anyone who flipped the flag without rebuilding.
+        wavelength_scale=_master_wavelength_scale(saved))
 
     # The blaze is the smooth part of the white light spectrum: the
     # lamp's own colour, the grating's blaze and the fibre throughput
@@ -1131,7 +1181,7 @@ def reduce_science(white_loc, arc_loc, science_files, out_dir=None,
         stem = os.path.splitext(os.path.basename(path))[0]
         out_path = os.path.join(out_dir, stem + "_wave.npz")
         save_reduced(out_path, orders, path, [os.path.basename(a) for a, _ in chosen],
-                     shift, tilt=tilt, tilt_reference_m=tilt_m)
+                     shift, tilt=tilt, tilt_reference_m=tilt_m, saved=saved)
         written.append((path, out_path, shift))
 
     print(f"\nDone: {len(written)} frame(s) written to {out_dir}")
