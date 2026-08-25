@@ -79,6 +79,14 @@ class Order:
         self.thar_spectrum = None
         self.science_spectrum = None
 
+        # Flat field products, filled in by flat_field.py. blaze is the
+        # smooth part of the white light spectrum, carrying the lamp's own
+        # colour and the grating's blaze together; pixel_response is what
+        # is left of it pixel to pixel, and is the only part divided out.
+        self.blaze = None
+        self.pixel_response = None       # measured through the science aperture
+        self.pixel_response_arc = None   # and through the narrower arc aperture
+
         # Calibration products, filled in by wavelength_solution.py
         self.wavelength_poly = None      # callable: pixel -> wavelength
         self.thar_pixels = None
@@ -160,6 +168,67 @@ class Order:
         return map_coordinates(image, np.vstack([y, self.center(y)]), order=3,
                                mode="nearest")
 
+    def _aperture_grid(self, ny, nx, n_sigma):
+        """Column indices and validity mask of the aperture at every row.
+
+        The aperture bounds are the ones aperture() gives, evaluated for
+        all rows at once. Rows are padded out to the widest aperture and
+        the padding is masked off, which lets the extractions run as array
+        operations rather than a Python loop over 4096 rows.
+
+        Parameters
+        ----------
+        ny : int
+            Number of rows in the image.
+        nx : int
+            Number of columns in the image.
+        n_sigma : float
+            Half width of the aperture in units of the profile sigma.
+
+        Returns
+        -------
+        columns : ndarray of int
+            Column index of each aperture slot, shape (ny, width), clipped
+            into the image so it is always safe to index with.
+        valid : ndarray of bool
+            True where that slot is really inside both the aperture and
+            the image, shape (ny, width).
+        centers : ndarray
+            Trace center per row, in pixels, shape (ny,).
+        sigmas : ndarray
+            Profile sigma per row, in pixels, shape (ny,).
+        """
+        y = np.arange(ny)
+        centers = np.asarray(self.center(y), float)
+        sigmas = np.asarray(self.sigma(y), float)
+
+        # The loop this replaced went through int(), which raises on a
+        # non-finite bound. Vectorised, np.floor(nan).astype(int) quietly
+        # becomes the most negative integer there is, and the aperture
+        # then lands nowhere and sums zero. A trace whose polynomial has
+        # gone non-finite is a broken trace, and it should say so rather
+        # than write a column of zeros into a spectrum.
+        edges = np.concatenate([centers - n_sigma * sigmas,
+                                centers + n_sigma * sigmas])
+        if not np.isfinite(edges).all():
+            raise ValueError(
+                "this order's trace or width polynomial is not finite over the "
+                "detector, so its extraction aperture is undefined. The trace fit "
+                "failed; check it with one_off/check_tracing.py rather than "
+                "extracting along it.")
+
+        lo = np.floor(centers - n_sigma * sigmas).astype(int)
+        hi = np.ceil(centers + n_sigma * sigmas).astype(int)      # exclusive
+
+        # Only ever as wide as the detector. A runaway width polynomial
+        # would otherwise ask for a (n_rows, huge) array before anything
+        # got the chance to clip it.
+        width = int(np.clip((hi - lo).max(), 1, nx))
+
+        columns = lo[:, None] + np.arange(width)[None, :]
+        valid = (columns < hi[:, None]) & (columns >= 0) & (columns < nx)
+        return np.clip(columns, 0, nx - 1), valid, centers, sigmas
+
     def extract_sum(self, image, n_sigma=3):
         """Extract a spectrum by summing counts across the aperture.
 
@@ -178,11 +247,10 @@ class Order:
             the image, so rows near an edge sum fewer columns.
         """
         ny, nx = image.shape
-        out = np.zeros(ny)
-        for y in range(ny):
-            xmin, xmax = self.aperture(y, n_sigma=n_sigma)
-            out[y] = np.sum(image[y, max(0, xmin):min(nx, xmax)])
-        return out
+        columns, valid, _, _ = self._aperture_grid(ny, nx, n_sigma)
+        rows = np.arange(ny)[:, None]
+        out = np.where(valid, image[rows, columns], 0.0).sum(axis=1)
+        return np.asarray(out, dtype=float)
 
     def extract_weighted(self, image, n_sigma=3):
         """Extract a spectrum with Gaussian weights across the aperture.
@@ -203,21 +271,21 @@ class Order:
             the weights sum to zero or less.
         """
         ny, nx = image.shape
-        out = np.zeros(ny)
-        for y in range(ny):
-            xmin, xmax = self.aperture(y, n_sigma=n_sigma)
-            xmin, xmax = max(0, xmin), min(nx, xmax)
-            if xmax - xmin < 2:
-                out[y] = np.nan
-                continue
-            x = np.arange(xmin, xmax)
-            weights = np.exp(-(x - self.center(y)) ** 2 / (2 * self.sigma(y) ** 2))
-            total = weights.sum()
-            if total <= 0:
-                out[y] = np.nan
-                continue
-            out[y] = np.sum(image[y, xmin:xmax] * (weights / total))
-        return out
+        columns, valid, centers, sigmas = self._aperture_grid(ny, nx, n_sigma)
+        rows = np.arange(ny)[:, None]
+
+        # A row of zero width has an empty aperture, so `valid` already
+        # rules it out; substituting here only keeps the division from
+        # warning about a row whose weights are discarded anyway.
+        safe_sigma = np.where(sigmas > 0, sigmas, 1.0)[:, None]
+        weights = np.exp(-(columns - centers[:, None]) ** 2 / (2.0 * safe_sigma ** 2))
+        weights = np.where(valid, weights, 0.0)
+        total = weights.sum(axis=1)
+
+        usable = (valid.sum(axis=1) >= 2) & (total > 0)
+        safe = np.where(usable, total, 1.0)
+        out = (np.where(valid, image[rows, columns], 0.0) * weights).sum(axis=1) / safe
+        return np.where(usable, out, np.nan)
 
     def extract_thar(self, thar_image, n_sigma=2.5):
         """Extract a ThAr arc spectrum with a tighter default aperture.
@@ -524,7 +592,22 @@ def trace_orders(white_loc, diagnose=False, n_expected=None, auto_exclude=True,
     if not white_files:
         raise FileNotFoundError(
             f"no frames matching {pattern or config.FRAME_PATTERN} in {white_loc}")
-    coadded = np.median([frames.read_image(path) for path in white_files], axis=0)
+    # float32 for the stack. Ten 4096 x 4096 frames is 1.3 GB in double and
+    # half that in single, and a median of ADU counts does not need the
+    # other seven digits.
+    stack = np.empty((len(white_files),) + frames.read_image(white_files[0]).shape,
+                     dtype=np.float32)
+    for i, path in enumerate(white_files):
+        stack[i] = frames.read_image(path)
+    coadded = np.median(stack, axis=0).astype(float)
+    del stack
+
+    saturated = np.mean(coadded >= config.FLAT_SATURATION)
+    if saturated > 0.0005:
+        print(f"WARNING: {100 * saturated:.2f}% of the coadded flat is at or above "
+              f"{config.FLAT_SATURATION:g} ADU. Saturated flats flatten the order "
+              f"profile, which widens the traces and corrupts any flat field taken "
+              f"from them. Shorten the white light exposures.")
 
     profile = coadded[coadded.shape[0] // 2, :]
     peaks, _ = find_peaks(profile, prominence=np.max(profile) * prominence_fraction,
